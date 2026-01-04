@@ -9,6 +9,9 @@ import { v4 as uuidv4 } from 'uuid';
 import sql from './sql';
 import { StorageAdapter } from '../StorageAdapter';
 import type { SchemaType, QueryType, QueryOptions } from '../StorageAdapter';
+
+import oracledb from 'oracledb';
+
 const Utils = require('../../../Utils');
 
 const OracleRelationDoesNotExistError = '42P01';
@@ -19,7 +22,7 @@ const OracleUniqueIndexViolationError = '23505';
 const logger = require('../../../logger');
 
 const debug = function (...args: any) {
-  args = ['PG: ' + arguments[0]].concat(args.slice(1, args.length));
+  args = ['ORACLE: ' + arguments[0]].concat(args.slice(1, args.length));
   const log = logger.getLogger();
   log.debug.apply(log, args);
 };
@@ -53,7 +56,7 @@ const parseTypeToOracleType = type => {
   }
 };
 
-const ParseToPosgresComparator = {
+const ParseToOracleComparator = {
   $gt: '>',
   $lt: '<',
   $gte: '>=',
@@ -218,9 +221,25 @@ const transformDotField = fieldName => {
     return `"${fieldName}"`;
   }
   const components = transformDotFieldToComponents(fieldName);
-  let name = components.slice(0, components.length - 1).join('->');
-  name += '->>' + components[components.length - 1];
-  return name;
+  if (components.length === 1) {
+    return components[0];
+  }
+  let name = '$.';
+  for (let i = 0; i < components.length - 1; ++i) {
+    if (Number.isInteger(components[i])) {
+      name += `[${components[i]}].`;
+    } else {
+      name += `${components[i]}.`;
+    }
+  }
+
+  if (Number.isInteger(components[components.length - 1])) {
+    name += `[${components[components.length - 1]}]`;
+  } else {
+    name += `${components[components.length - 1]}`;
+  }
+
+  return `JSON_VALUE(components[0], '${name}')`;
 };
 
 const transformAggregateField = fieldName => {
@@ -268,16 +287,23 @@ const joinTablesForSchema = schema => {
 
 interface WhereClause {
   pattern: string;
-  values: Array<any>;
-  sorts: Array<any>;
+  binds: { [string]:any };
+  sorts: Array<string>;
 }
 
-const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClause => {
+const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
   const patterns = [];
-  let values = [];
+  const binds = {};
   const sorts = [];
+  let bindIndex = 0;
+
+  // Вспомогательная функция для генерации уникального имени bind-параметра
+  const getBindName = (prefix = 'p') => {
+    return `${prefix}${bindIndex++}`;
+  };
 
   schema = toOracleSchema(schema);
+
   for (const fieldName in query) {
     const isArrayField =
       schema.fields && schema.fields[fieldName] && schema.fields[fieldName].type === 'Array';
@@ -291,73 +317,71 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         continue;
       }
     }
+
     const authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
     if (authDataMatch) {
       // TODO: Handle querying by _auth_data_provider, authData is stored in authData field
       continue;
     } else if (caseInsensitive && (fieldName === 'username' || fieldName === 'email')) {
-      patterns.push(`LOWER($${index}:name) = LOWER($${index + 1})`);
-      values.push(fieldName, fieldValue);
-      index += 2;
+      const nameParam = getBindName('field');
+      const valueParam = getBindName('val');
+      patterns.push(`LOWER(${nameParam}) = LOWER(:${valueParam})`);
+      binds[nameParam] = fieldName;
+      binds[valueParam] = fieldValue;
     } else if (fieldName.indexOf('.') >= 0) {
       let name = transformDotField(fieldName);
       if (fieldValue === null) {
-        patterns.push(`$${index}:raw IS NULL`);
-        values.push(name);
-        index += 1;
+        patterns.push(`${name} IS NULL`);
         continue;
       } else {
         if (fieldValue.$in) {
-          name = transformDotFieldToComponents(fieldName).join('->');
-          patterns.push(`($${index}:raw)::jsonb @> $${index + 1}::jsonb`);
-          values.push(name, JSON.stringify(fieldValue.$in));
-          index += 2;
+          name = transformDotFieldToComponents(fieldName).join('.');
+          const nameParam = getBindName('json');
+          const valueParam = getBindName('val');
+          // Oracle JSON_EXISTS или JSON_QUERY для проверки вхождения
+          patterns.push(`JSON_EXISTS(${name}, '$[*]?(@.value == $${valueParam})')`);
+          binds[valueParam] = JSON.stringify(fieldValue.$in);
         } else if (fieldValue.$regex) {
           // Handle later
         } else if (typeof fieldValue !== 'object') {
-          patterns.push(`$${index}:raw = $${index + 1}::text`);
-          values.push(name, fieldValue);
-          index += 2;
+          const valueParam = getBindName('val');
+          patterns.push(`${name} = :${valueParam}`);
+          binds[valueParam] = fieldValue;
         }
       }
     } else if (fieldValue === null || fieldValue === undefined) {
-      patterns.push(`$${index}:name IS NULL`);
-      values.push(fieldName);
-      index += 1;
+      patterns.push(`${fieldName} IS NULL`);
       continue;
     } else if (typeof fieldValue === 'string') {
-      patterns.push(`$${index}:name = $${index + 1}`);
-      values.push(fieldName, fieldValue);
-      index += 2;
+      const valueParam = getBindName('val');
+      patterns.push(`${fieldName} = :${valueParam}`);
+      binds[valueParam] = fieldValue;
     } else if (typeof fieldValue === 'boolean') {
-      patterns.push(`$${index}:name = $${index + 1}`);
-      // Can't cast boolean to double precision
+      const valueParam = getBindName('val');
+      patterns.push(`${fieldName} = :${valueParam}`);
+      // Can't cast boolean to number
       if (schema.fields[fieldName] && schema.fields[fieldName].type === 'Number') {
         // Should always return zero results
         const MAX_INT_PLUS_ONE = 9223372036854775808;
-        values.push(fieldName, MAX_INT_PLUS_ONE);
+        binds[valueParam] = MAX_INT_PLUS_ONE;
       } else {
-        values.push(fieldName, fieldValue);
+        binds[valueParam] = fieldValue ? 1 : 0; // Oracle использует 1/0 для boolean
       }
-      index += 2;
     } else if (typeof fieldValue === 'number') {
-      patterns.push(`$${index}:name = $${index + 1}`);
-      values.push(fieldName, fieldValue);
-      index += 2;
+      const valueParam = getBindName('val');
+      patterns.push(`${fieldName} = :${valueParam}`);
+      binds[valueParam] = fieldValue;
     } else if (['$or', '$nor', '$and'].includes(fieldName)) {
       const clauses = [];
-      const clauseValues = [];
       fieldValue.forEach(subQuery => {
         const clause = buildWhereClause({
           schema,
           query: subQuery,
-          index,
           caseInsensitive,
         });
         if (clause.pattern.length > 0) {
           clauses.push(clause.pattern);
-          clauseValues.push(...clause.values);
-          index += clause.values.length;
+          Object.assign(binds, clause.binds);
         }
       });
 
@@ -365,81 +389,81 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       const not = fieldName === '$nor' ? ' NOT ' : '';
 
       patterns.push(`${not}(${clauses.join(orOrAnd)})`);
-      values.push(...clauseValues);
     }
 
     if (fieldValue.$ne !== undefined) {
       if (isArrayField) {
+        const valueParam = getBindName('val');
         fieldValue.$ne = JSON.stringify([fieldValue.$ne]);
-        patterns.push(`NOT array_contains($${index}:name, $${index + 1})`);
+        patterns.push(`NOT array_contains(${fieldName}, :${valueParam})`);
+        binds[valueParam] = fieldValue.$ne;
       } else {
         if (fieldValue.$ne === null) {
-          patterns.push(`$${index}:name IS NOT NULL`);
-          values.push(fieldName);
-          index += 1;
+          patterns.push(`${fieldName} IS NOT NULL`);
           continue;
         } else {
           // if not null, we need to manually exclude null
           if (fieldValue.$ne.__type === 'GeoPoint') {
+            const lonParam = getBindName('lon');
+            const latParam = getBindName('lat');
             patterns.push(
-              `($${index}:name <> POINT($${index + 1}, $${index + 2}) OR $${index}:name IS NULL)`
+              `(${fieldName} <> SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL) OR ${fieldName} IS NULL)`
             );
+            binds[lonParam] = fieldValue.$ne.longitude;
+            binds[latParam] = fieldValue.$ne.latitude;
           } else {
             if (fieldName.indexOf('.') >= 0) {
               const castType = toOracleValueCastType(fieldValue.$ne);
               const constraintFieldName = castType
-                ? `CAST ((${transformDotField(fieldName)}) AS ${castType})`
+                ? `CAST(${transformDotField(fieldName)} AS ${castType})`
                 : transformDotField(fieldName);
+              const valueParam = getBindName('val');
               patterns.push(
-                `(${constraintFieldName} <> $${index + 1} OR ${constraintFieldName} IS NULL)`
+                `(${constraintFieldName} <> :${valueParam} OR ${constraintFieldName} IS NULL)`
               );
+              binds[valueParam] = fieldValue.$ne;
             } else if (typeof fieldValue.$ne === 'object' && fieldValue.$ne.$relativeTime) {
               throw new Parse.Error(
                 Parse.Error.INVALID_JSON,
                 '$relativeTime can only be used with the $lt, $lte, $gt, and $gte operators'
               );
             } else {
-              patterns.push(`($${index}:name <> $${index + 1} OR $${index}:name IS NULL)`);
+              const valueParam = getBindName('val');
+              patterns.push(`(${fieldName} <> :${valueParam} OR ${fieldName} IS NULL)`);
+              binds[valueParam] = fieldValue.$ne;
             }
           }
         }
       }
-      if (fieldValue.$ne.__type === 'GeoPoint') {
-        const point = fieldValue.$ne;
-        values.push(fieldName, point.longitude, point.latitude);
-        index += 3;
-      } else {
-        // TODO: support arrays
-        values.push(fieldName, fieldValue.$ne);
-        index += 2;
-      }
     }
+
     if (fieldValue.$eq !== undefined) {
       if (fieldValue.$eq === null) {
-        patterns.push(`$${index}:name IS NULL`);
-        values.push(fieldName);
-        index += 1;
+        patterns.push(`${fieldName} IS NULL`);
       } else {
         if (fieldName.indexOf('.') >= 0) {
           const castType = toOracleValueCastType(fieldValue.$eq);
           const constraintFieldName = castType
-            ? `CAST ((${transformDotField(fieldName)}) AS ${castType})`
+            ? `CAST(${transformDotField(fieldName)} AS ${castType})`
             : transformDotField(fieldName);
-          values.push(fieldValue.$eq);
-          patterns.push(`${constraintFieldName} = $${index++}`);
+          const valueParam = getBindName('val');
+          patterns.push(`${constraintFieldName} = :${valueParam}`);
+          binds[valueParam] = fieldValue.$eq;
         } else if (typeof fieldValue.$eq === 'object' && fieldValue.$eq.$relativeTime) {
           throw new Parse.Error(
             Parse.Error.INVALID_JSON,
             '$relativeTime can only be used with the $lt, $lte, $gt, and $gte operators'
           );
         } else {
-          values.push(fieldName, fieldValue.$eq);
-          patterns.push(`$${index}:name = $${index + 1}`);
-          index += 2;
+          const valueParam = getBindName('val');
+          patterns.push(`${fieldName} = :${valueParam}`);
+          binds[valueParam] = fieldValue.$eq;
         }
       }
     }
+
     const isInOrNin = Array.isArray(fieldValue.$in) || Array.isArray(fieldValue.$nin);
+
     if (
       Array.isArray(fieldValue.$in) &&
       isArrayField &&
@@ -448,58 +472,57 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
     ) {
       const inPatterns = [];
       let allowNull = false;
-      values.push(fieldName);
-      fieldValue.$in.forEach((listElem, listIndex) => {
+
+      fieldValue.$in.forEach(listElem => {
         if (listElem === null) {
           allowNull = true;
         } else {
-          values.push(listElem);
-          inPatterns.push(`$${index + 1 + listIndex - (allowNull ? 1 : 0)}`);
+          const valueParam = getBindName('val');
+          binds[valueParam] = listElem;
+          inPatterns.push(`:${valueParam}`);
         }
       });
+
       if (allowNull) {
-        patterns.push(`($${index}:name IS NULL OR $${index}:name && ARRAY[${inPatterns.join()}])`);
+        patterns.push(`(${fieldName} IS NULL OR ${fieldName} IN (${inPatterns.join(',')}))`);
       } else {
-        patterns.push(`$${index}:name && ARRAY[${inPatterns.join()}]`);
+        patterns.push(`${fieldName} IN (${inPatterns.join(',')})`);
       }
-      index = index + 1 + inPatterns.length;
     } else if (isInOrNin) {
-      var createConstraint = (baseArray, notIn) => {
-        const not = notIn ? ' NOT ' : '';
+      const createConstraint = (baseArray, notIn) => {
+        const not = notIn ? ' NOT' : '';
         if (baseArray.length > 0) {
           if (isArrayField) {
-            patterns.push(`${not} array_contains($${index}:name, $${index + 1})`);
-            values.push(fieldName, JSON.stringify(baseArray));
-            index += 2;
+            const valueParam = getBindName('val');
+            patterns.push(`${not} array_contains(${fieldName}, :${valueParam})`);
+            binds[valueParam] = JSON.stringify(baseArray);
           } else {
             // Handle Nested Dot Notation Above
             if (fieldName.indexOf('.') >= 0) {
               return;
             }
             const inPatterns = [];
-            values.push(fieldName);
-            baseArray.forEach((listElem, listIndex) => {
+            baseArray.forEach(listElem => {
               if (listElem != null) {
-                values.push(listElem);
-                inPatterns.push(`$${index + 1 + listIndex}`);
+                const valueParam = getBindName('val');
+                binds[valueParam] = listElem;
+                inPatterns.push(`:${valueParam}`);
               }
             });
-            patterns.push(`$${index}:name ${not} IN (${inPatterns.join()})`);
-            index = index + 1 + inPatterns.length;
+            patterns.push(`${fieldName}${not} IN (${inPatterns.join(',')})`);
           }
         } else if (!notIn) {
-          values.push(fieldName);
-          patterns.push(`$${index}:name IS NULL`);
-          index = index + 1;
+          patterns.push(`${fieldName} IS NULL`);
         } else {
           // Handle empty array
           if (notIn) {
             patterns.push('1 = 1'); // Return all values
           } else {
-            patterns.push('1 = 2'); // Return no values
+            patterns.push('1 = 0'); // Return no values
           }
         }
       };
+
       if (fieldValue.$in) {
         createConstraint(
           _.flatMap(fieldValue.$in, elt => elt),
@@ -519,6 +542,7 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
     }
 
     if (Array.isArray(fieldValue.$all) && isArrayField) {
+      const valueParam = getBindName('val');
       if (isAnyValueRegexStartsWith(fieldValue.$all)) {
         if (!isAllValuesRegexOrNone(fieldValue.$all)) {
           throw new Parse.Error(
@@ -531,17 +555,16 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
           const value = processRegexPattern(fieldValue.$all[i].$regex);
           fieldValue.$all[i] = value.substring(1) + '%';
         }
-        patterns.push(`array_contains_all_regex($${index}:name, $${index + 1}::jsonb)`);
+        patterns.push(`array_contains_all_regex(${fieldName}, :${valueParam})`);
       } else {
-        patterns.push(`array_contains_all($${index}:name, $${index + 1}::jsonb)`);
+        patterns.push(`array_contains_all(${fieldName}, :${valueParam})`);
       }
-      values.push(fieldName, JSON.stringify(fieldValue.$all));
-      index += 2;
+      binds[valueParam] = JSON.stringify(fieldValue.$all);
     } else if (Array.isArray(fieldValue.$all)) {
       if (fieldValue.$all.length === 1) {
-        patterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue.$all[0].objectId);
-        index += 2;
+        const valueParam = getBindName('val');
+        patterns.push(`${fieldName} = :${valueParam}`);
+        binds[valueParam] = fieldValue.$all[0].objectId;
       }
     }
 
@@ -552,12 +575,10 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
           '$relativeTime can only be used with the $lt, $lte, $gt, and $gte operators'
         );
       } else if (fieldValue.$exists) {
-        patterns.push(`$${index}:name IS NOT NULL`);
+        patterns.push(`${fieldName} IS NOT NULL`);
       } else {
-        patterns.push(`$${index}:name IS NULL`);
+        patterns.push(`${fieldName} IS NULL`);
       }
-      values.push(fieldName);
-      index += 1;
     }
 
     if (fieldValue.$containedBy) {
@@ -565,15 +586,14 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       if (!(arr instanceof Array)) {
         throw new Parse.Error(Parse.Error.INVALID_JSON, `bad $containedBy: should be an array`);
       }
-
-      patterns.push(`$${index}:name <@ $${index + 1}::jsonb`);
-      values.push(fieldName, JSON.stringify(arr));
-      index += 2;
+      const valueParam = getBindName('val');
+      // Oracle: использование JSON_QUERY для проверки вхождения
+      patterns.push(`JSON_EXISTS(${fieldName}, '$[*]?(@.value in ($${valueParam}))')`);
+      binds[valueParam] = JSON.stringify(arr);
     }
 
     if (fieldValue.$text) {
       const search = fieldValue.$text.$search;
-      let language = 'english';
       if (typeof search !== 'object') {
         throw new Parse.Error(Parse.Error.INVALID_JSON, `bad $text: $search, should be object`);
       }
@@ -582,8 +602,6 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       }
       if (search.$language && typeof search.$language !== 'string') {
         throw new Parse.Error(Parse.Error.INVALID_JSON, `bad $text: $language, should be string`);
-      } else if (search.$language) {
-        language = search.$language;
       }
       if (search.$caseSensitive && typeof search.$caseSensitive !== 'boolean') {
         throw new Parse.Error(
@@ -601,35 +619,33 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
           Parse.Error.INVALID_JSON,
           `bad $text: $diacriticSensitive, should be boolean`
         );
-      } else if (search.$diacriticSensitive === false) {
-        throw new Parse.Error(
-          Parse.Error.INVALID_JSON,
-          `bad $text: $diacriticSensitive - false not supported, install Oracle Unaccent Extension`
-        );
       }
-      patterns.push(
-        `to_tsvector($${index}, $${index + 1}:name) @@ to_tsquery($${index + 2}, $${index + 3})`
-      );
-      values.push(language, fieldName, language, search.$term);
-      index += 4;
+
+      const termParam = getBindName('term');
+      // Oracle Text: CONTAINS operator
+      patterns.push(`CONTAINS(${fieldName}, :${termParam}) > 0`);
+      binds[termParam] = search.$term;
     }
 
     if (fieldValue.$nearSphere) {
       const point = fieldValue.$nearSphere;
       const distance = fieldValue.$maxDistance;
       const distanceInKM = distance * 6371 * 1000;
+
+      const lonParam = getBindName('lon');
+      const latParam = getBindName('lat');
+      const distParam = getBindName('dist');
+
+      // Oracle Spatial: SDO_GEOM.SDO_DISTANCE
       patterns.push(
-        `ST_DistanceSphere($${index}:name::geometry, POINT($${index + 1}, $${
-          index + 2
-        })::geometry) <= $${index + 3}`
+        `SDO_GEOM.SDO_DISTANCE(${fieldName}, SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL), 0.005) <= :${distParam}`
       );
       sorts.push(
-        `ST_DistanceSphere($${index}:name::geometry, POINT($${index + 1}, $${
-          index + 2
-        })::geometry) ASC`
+        `SDO_GEOM.SDO_DISTANCE(${fieldName}, SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL), 0.005) ASC`
       );
-      values.push(fieldName, point.longitude, point.latitude, distanceInKM);
-      index += 4;
+      binds[lonParam] = point.longitude;
+      binds[latParam] = point.latitude;
+      binds[distParam] = distanceInKM;
     }
 
     if (fieldValue.$within && fieldValue.$within.$box) {
@@ -639,9 +655,15 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       const right = box[1].longitude;
       const top = box[1].latitude;
 
-      patterns.push(`$${index}:name::point <@ $${index + 1}::box`);
-      values.push(fieldName, `((${left}, ${bottom}), (${right}, ${top}))`);
-      index += 2;
+      const boxParam = getBindName('box');
+      // Oracle Spatial: SDO_GEOMETRY для прямоугольника
+      patterns.push(
+        `SDO_RELATE(${fieldName}, SDO_GEOMETRY(2003, NULL, NULL, SDO_ELEM_INFO_ARRAY(1,1003,3), SDO_ORDINATE_ARRAY(:${boxParam}_minx, :${boxParam}_miny, :${boxParam}_maxx, :${boxParam}_maxy)), 'mask=INSIDE') = 'TRUE'`
+      );
+      binds[`${boxParam}_minx`] = left;
+      binds[`${boxParam}_miny`] = bottom;
+      binds[`${boxParam}_maxx`] = right;
+      binds[`${boxParam}_maxy`] = top;
     }
 
     if (fieldValue.$geoWithin && fieldValue.$geoWithin.$centerSphere) {
@@ -652,7 +674,7 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
           'bad $geoWithin value; $centerSphere should be an array of Parse.GeoPoint and distance'
         );
       }
-      // Get point, convert to geo point if necessary and validate
+
       let point = centerSphere[0];
       if (point instanceof Array && point.length === 2) {
         point = new Parse.GeoPoint(point[1], point[0]);
@@ -663,7 +685,7 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         );
       }
       Parse.GeoPoint._validate(point.latitude, point.longitude);
-      // Get distance and validate
+
       const distance = centerSphere[1];
       if (isNaN(distance) || distance < 0) {
         throw new Parse.Error(
@@ -672,18 +694,23 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         );
       }
       const distanceInKM = distance * 6371 * 1000;
+
+      const lonParam = getBindName('lon');
+      const latParam = getBindName('lat');
+      const distParam = getBindName('dist');
+
       patterns.push(
-        `ST_DistanceSphere($${index}:name::geometry, POINT($${index + 1}, $${
-          index + 2
-        })::geometry) <= $${index + 3}`
+        `SDO_GEOM.SDO_DISTANCE(${fieldName}, SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL), 0.005) <= :${distParam}`
       );
-      values.push(fieldName, point.longitude, point.latitude, distanceInKM);
-      index += 4;
+      binds[lonParam] = point.longitude;
+      binds[latParam] = point.latitude;
+      binds[distParam] = distanceInKM;
     }
 
     if (fieldValue.$geoWithin && fieldValue.$geoWithin.$polygon) {
       const polygon = fieldValue.$geoWithin.$polygon;
       let points;
+
       if (typeof polygon === 'object' && polygon.__type === 'Polygon') {
         if (!polygon.coordinates || polygon.coordinates.length < 3) {
           throw new Parse.Error(
@@ -706,25 +733,32 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
           "bad $geoWithin value; $polygon should be Polygon object or Array of Parse.GeoPoint's"
         );
       }
-      points = points
-        .map(point => {
-          if (point instanceof Array && point.length === 2) {
-            Parse.GeoPoint._validate(point[1], point[0]);
-            return `(${point[0]}, ${point[1]})`;
-          }
-          if (typeof point !== 'object' || point.__type !== 'GeoPoint') {
-            throw new Parse.Error(Parse.Error.INVALID_JSON, 'bad $geoWithin value');
-          } else {
-            Parse.GeoPoint._validate(point.latitude, point.longitude);
-          }
-          return `(${point.longitude}, ${point.latitude})`;
-        })
-        .join(', ');
 
-      patterns.push(`$${index}:name::point <@ $${index + 1}::polygon`);
-      values.push(fieldName, `(${points})`);
-      index += 2;
+      const ordinates = [];
+      points.forEach(point => {
+        if (point instanceof Array && point.length === 2) {
+          Parse.GeoPoint._validate(point[1], point[0]);
+          ordinates.push(point[0], point[1]);
+        } else if (typeof point === 'object' && point.__type === 'GeoPoint') {
+          Parse.GeoPoint._validate(point.latitude, point.longitude);
+          ordinates.push(point.longitude, point.latitude);
+        } else {
+          throw new Parse.Error(Parse.Error.INVALID_JSON, 'bad $geoWithin value');
+        }
+      });
+
+      const polyParam = getBindName('poly');
+      // Oracle Spatial: создание полигона через SDO_ORDINATE_ARRAY
+      const ordinateBinds = ordinates.map((_, i) => `:${polyParam}_${i}`).join(',');
+      ordinates.forEach((ord, i) => {
+        binds[`${polyParam}_${i}`] = ord;
+      });
+
+      patterns.push(
+        `SDO_RELATE(${fieldName}, SDO_GEOMETRY(2003, NULL, NULL, SDO_ELEM_INFO_ARRAY(1,1003,1), SDO_ORDINATE_ARRAY(${ordinateBinds})), 'mask=INSIDE') = 'TRUE'`
+      );
     }
+
     if (fieldValue.$geoIntersects && fieldValue.$geoIntersects.$point) {
       const point = fieldValue.$geoIntersects.$point;
       if (typeof point !== 'object' || point.__type !== 'GeoPoint') {
@@ -732,21 +766,28 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
           Parse.Error.INVALID_JSON,
           'bad $geoIntersect value; $point should be GeoPoint'
         );
-      } else {
-        Parse.GeoPoint._validate(point.latitude, point.longitude);
       }
-      patterns.push(`$${index}:name::polygon @> $${index + 1}::point`);
-      values.push(fieldName, `(${point.longitude}, ${point.latitude})`);
-      index += 2;
+      Parse.GeoPoint._validate(point.latitude, point.longitude);
+
+      const lonParam = getBindName('lon');
+      const latParam = getBindName('lat');
+
+      patterns.push(
+        `SDO_RELATE(${fieldName}, SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL), 'mask=CONTAINS') = 'TRUE'`
+      );
+      binds[lonParam] = point.longitude;
+      binds[latParam] = point.latitude;
     }
 
     if (fieldValue.$regex) {
       let regex = fieldValue.$regex;
-      let operator = '~';
+      let operator = 'REGEXP_LIKE';
       const opts = fieldValue.$options;
+      let regexOpts = '';
+
       if (opts) {
         if (opts.indexOf('i') >= 0) {
-          operator = '~*';
+          regexOpts += 'i';
         }
         if (opts.indexOf('x') >= 0) {
           regex = removeWhiteSpace(regex);
@@ -756,77 +797,89 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       const name = transformDotField(fieldName);
       regex = processRegexPattern(regex);
 
-      patterns.push(`$${index}:raw ${operator} '$${index + 1}:raw'`);
-      values.push(name, regex);
-      index += 2;
+      const regexParam = getBindName('regex');
+      if (regexOpts) {
+        const optsParam = getBindName('opts');
+        patterns.push(`REGEXP_LIKE(${name}, :${regexParam}, :${optsParam})`);
+        binds[regexParam] = regex;
+        binds[optsParam] = regexOpts;
+      } else {
+        patterns.push(`REGEXP_LIKE(${name}, :${regexParam})`);
+        binds[regexParam] = regex;
+      }
     }
 
     if (fieldValue.__type === 'Pointer') {
+      const valueParam = getBindName('val');
       if (isArrayField) {
-        patterns.push(`array_contains($${index}:name, $${index + 1})`);
-        values.push(fieldName, JSON.stringify([fieldValue]));
-        index += 2;
+        patterns.push(`array_contains(${fieldName}, :${valueParam})`);
+        binds[valueParam] = JSON.stringify([fieldValue]);
       } else {
-        patterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue.objectId);
-        index += 2;
+        patterns.push(`${fieldName} = :${valueParam}`);
+        binds[valueParam] = fieldValue.objectId;
       }
     }
 
     if (fieldValue.__type === 'Date') {
-      patterns.push(`$${index}:name = $${index + 1}`);
-      values.push(fieldName, fieldValue.iso);
-      index += 2;
+      const valueParam = getBindName('val');
+      patterns.push(
+        `${fieldName} = TO_TIMESTAMP(:${valueParam}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`
+      );
+      binds[valueParam] = fieldValue.iso;
     }
 
     if (fieldValue.__type === 'GeoPoint') {
-      patterns.push(`$${index}:name ~= POINT($${index + 1}, $${index + 2})`);
-      values.push(fieldName, fieldValue.longitude, fieldValue.latitude);
-      index += 3;
+      const lonParam = getBindName('lon');
+      const latParam = getBindName('lat');
+      patterns.push(
+        `SDO_GEOM.SDO_DISTANCE(${fieldName}, SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL), 0.005) < 0.001`
+      );
+      binds[lonParam] = fieldValue.longitude;
+      binds[latParam] = fieldValue.latitude;
     }
 
     if (fieldValue.__type === 'Polygon') {
       const value = convertPolygonToSQL(fieldValue.coordinates);
-      patterns.push(`$${index}:name ~= $${index + 1}::polygon`);
-      values.push(fieldName, value);
-      index += 2;
+      const valueParam = getBindName('val');
+      patterns.push(`${fieldName} = :${valueParam}`);
+      binds[valueParam] = value;
     }
 
-    Object.keys(ParseToPosgresComparator).forEach(cmp => {
+    Object.keys(ParseToOracleComparator).forEach(cmp => {
       if (fieldValue[cmp] || fieldValue[cmp] === 0) {
-        const pgComparator = ParseToPosgresComparator[cmp];
+        const oracleComparator = ParseToOracleComparator[cmp];
         let constraintFieldName;
-        let OracleValue = toOracleValue(fieldValue[cmp]);
+        let oracleValue = toOracleValue(fieldValue[cmp]);
 
         if (fieldName.indexOf('.') >= 0) {
           const castType = toOracleValueCastType(fieldValue[cmp]);
           constraintFieldName = castType
-            ? `CAST ((${transformDotField(fieldName)}) AS ${castType})`
+            ? `CAST(${transformDotField(fieldName)} AS ${castType})`
             : transformDotField(fieldName);
         } else {
-          if (typeof OracleValue === 'object' && OracleValue.$relativeTime) {
+          if (typeof oracleValue === 'object' && oracleValue.$relativeTime) {
             if (schema.fields[fieldName].type !== 'Date') {
               throw new Parse.Error(
                 Parse.Error.INVALID_JSON,
                 '$relativeTime can only be used with Date field'
               );
             }
-            const parserResult = Utils.relativeTimeToDate(OracleValue.$relativeTime);
+            const parserResult = Utils.relativeTimeToDate(oracleValue.$relativeTime);
             if (parserResult.status === 'success') {
-              OracleValue = toOracleValue(parserResult.result);
+              oracleValue = toOracleValue(parserResult.result);
             } else {
               console.error('Error while parsing relative date', parserResult);
               throw new Parse.Error(
                 Parse.Error.INVALID_JSON,
-                `bad $relativeTime (${OracleValue.$relativeTime}) value. ${parserResult.info}`
+                `bad $relativeTime (${oracleValue.$relativeTime}) value. ${parserResult.info}`
               );
             }
           }
-          constraintFieldName = `$${index++}:name`;
-          values.push(fieldName);
+          constraintFieldName = fieldName;
         }
-        values.push(OracleValue);
-        patterns.push(`${constraintFieldName} ${pgComparator} $${index++}`);
+        const valueParam = getBindName('val');
+        binds[valueParam] = oracleValue;
+        patterns.push(`${constraintFieldName} ${oracleComparator} :${valueParam}`);
       }
     });
 
@@ -837,8 +890,13 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       );
     }
   }
-  values = values.map(transformValue);
-  return { pattern: patterns.join(' AND '), values, sorts };
+
+  // Преобразование значений через transformValue
+  Object.keys(binds).forEach(key => {
+    binds[key] = transformValue(binds[key]);
+  });
+
+  return { pattern: patterns.join(' AND '), binds, sorts };
 };
 
 export class OracleStorageAdapter implements StorageAdapter {
@@ -876,14 +934,84 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
 
   //Note that analyze=true will run the query, executing INSERTS, DELETES, etc.
-  createExplainableQuery(query: string, analyze: boolean = false) {
+
+  _prepareExplainQuery(
+    query: string,
+    analyze: boolean = false,
+    statementId?: string
+  ): {
+    explainQuery: string,
+    fetchQuery: string,
+    cleanupQuery: string,
+  } {
+    const stmtId = statementId || `STMT_${Date.now()}`;
     if (analyze) {
-      return 'EXPLAIN (ANALYZE, FORMAT JSON) ' + query;
+      return {
+        explainQuery: `
+          ALTER SESSION SET STATISTICS_LEVEL = ALL;
+          ${query};
+      `.trim(),
+        fetchQuery: `
+        SELECT DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +OUTLINE') as plan
+        FROM DUAL
+      `,
+        cleanupQuery: `ALTER SESSION SET STATISTICS_LEVEL = TYPICAL`,
+      };
     } else {
-      return 'EXPLAIN (FORMAT JSON) ' + query;
+      return {
+        explainQuery: `EXPLAIN PLAN SET STATEMENT_ID = '${stmtId}' FOR ${query}`,
+        fetchQuery: `
+            SELECT 
+              JSON_OBJECT(
+                'operation' VALUE operation,
+                'options' VALUE options,
+                'object_name' VALUE object_name,
+                'object_type' VALUE object_type,
+                'cost' VALUE cost,
+                'cardinality' VALUE cardinality,
+                'bytes' VALUE bytes,
+                'cpu_cost' VALUE cpu_cost,
+                'io_cost' VALUE io_cost,
+                'access_predicates' VALUE access_predicates,
+                'filter_predicates' VALUE filter_predicates
+              ) as plan_json
+            FROM PLAN_TABLE 
+            WHERE STATEMENT_ID = '${stmtId}'
+            ORDER BY id
+        `,
+        cleanupQuery: `DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = '${stmtId}'`,
+      };
     }
   }
 
+  async explainQuery(connection: any, query: string, analyze: boolean = false): Promise<any> {
+    const explainQuery = this._prepareExplainQuery(query, analyze);
+
+    try {
+      await connection.execute(explainQuery.explainQuery);
+
+      const result = await connection.execute(
+        explainQuery.fetchQuery,
+        {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      if (explainQuery.cleanupQuery) {
+        await connection.execute(explainQuery.cleanupQuery);
+      }
+
+      return result.rows.map(row => row.PLAN_TABLE_OUTPUT || row.plan).join('\n');
+    } catch (error) {
+      if (explainQuery.cleanupQuery) {
+        try {
+          await connection.execute(explainQuery.cleanupQuery);
+        } catch (cleanupError) {
+          console.error('Cleanup error:', cleanupError);
+        }
+      }
+      throw error;
+    }
+  }
   handleShutdown() {
     if (this._stream) {
       this._stream.done();
@@ -922,30 +1050,64 @@ export class OracleStorageAdapter implements StorageAdapter {
     conn = conn || this._client;
     await conn
       .none(
-        'CREATE TABLE IF NOT EXISTS "_SCHEMA" ( "className" varChar(120), "schema" jsonb, "isParseClass" bool, PRIMARY KEY ("className") )'
+        'CREATE TABLE "_SCHEMA" (\n' +
+          '      "className" VARCHAR2(120),\n' +
+          '      "schema" JSON,\n' +
+          '      "isParseClass" NUMBER(1),\n' +
+          '      CONSTRAINT "_SCHEMA_PK" PRIMARY KEY ("className")\n' +
+          '    )'
       )
       .catch(error => {
         throw error;
       });
   }
 
-  async classExists(name: string) {
-    return this._client.one(
-      'SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)',
-      [name],
-      a => a.exists
+  async classExists(name: string): Promise<boolean> {
+    // Вариант 1: Проверка через USER_TABLES (рекомендуется)
+    const sql = `
+    SELECT COUNT(*) as cnt
+    FROM user_tables
+    WHERE table_name = :tableName
+  `;
+
+    const result = await this._client.execute(
+      sql,
+      { tableName: name.toUpperCase() }, // Oracle хранит имена в верхнем регистре
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
+
+    return result.rows[0].CNT > 0;
   }
 
-  async setClassLevelPermissions(className: string, CLPs: any) {
-    await this._client.task('set-class-level-permissions', async t => {
-      const values = [className, 'schema', 'classLevelPermissions', JSON.stringify(CLPs)];
-      await t.none(
-        `UPDATE "_SCHEMA" SET $2:name = json_object_set_key($2:name, $3::text, $4::jsonb) WHERE "className" = $1`,
-        values
+  async setClassLevelPermissions(className: string, CLPs: any): Promise<void> {
+    const sql = `
+    UPDATE "_SCHEMA"
+    SET "schema" = JSON_TRANSFORM(
+      "schema",
+      SET '$.classLevelPermissions' = :clps
+    )
+    WHERE "className" = :className
+  `;
+
+    try {
+      const result = await this._client.execute(
+        sql,
+        {
+          className: className,
+          clps: JSON.stringify(CLPs)
+        },
+        { autoCommit: true }
       );
-    });
-    this._notifySchemaChange();
+
+      if (result.rowsAffected === 0) {
+        throw new Error(`Class ${className} not found in schema`);
+      }
+
+      this._notifySchemaChange();
+    } catch (error) {
+      console.error('Error setting class level permissions:', error);
+      throw error;
+    }
   }
 
   async setIndexesWithSchemaFormat(
@@ -953,92 +1115,173 @@ export class OracleStorageAdapter implements StorageAdapter {
     submittedIndexes: any,
     existingIndexes: any = {},
     fields: any,
-    conn: ?any
+    conn?: any
   ): Promise<void> {
-    conn = conn || this._client;
-    const self = this;
-    if (submittedIndexes === undefined) {
-      return Promise.resolve();
-    }
-    if (Object.keys(existingIndexes).length === 0) {
-      existingIndexes = { _id_: { _id: 1 } };
-    }
-    const deletedIndexes = [];
-    const insertedIndexes = [];
-    Object.keys(submittedIndexes).forEach(name => {
-      const field = submittedIndexes[name];
-      if (existingIndexes[name] && field.__op !== 'Delete') {
-        throw new Parse.Error(Parse.Error.INVALID_QUERY, `Index ${name} exists, cannot update.`);
+    const connection = conn || await this._client.getConnection();
+    const shouldCloseConnection = !conn;
+
+    try {
+      if (submittedIndexes === undefined) {
+        return Promise.resolve();
       }
-      if (!existingIndexes[name] && field.__op === 'Delete') {
-        throw new Parse.Error(
-          Parse.Error.INVALID_QUERY,
-          `Index ${name} does not exist, cannot delete.`
-        );
+
+      if (Object.keys(existingIndexes).length === 0) {
+        existingIndexes = { _id_: { _id: 1 } };
       }
-      if (field.__op === 'Delete') {
-        deletedIndexes.push(name);
-        delete existingIndexes[name];
-      } else {
-        Object.keys(field).forEach(key => {
-          if (!Object.prototype.hasOwnProperty.call(fields, key)) {
-            throw new Parse.Error(
-              Parse.Error.INVALID_QUERY,
-              `Field ${key} does not exist, cannot add index.`
-            );
+
+      const deletedIndexes = [];
+      const insertedIndexes = [];
+
+      Object.keys(submittedIndexes).forEach(name => {
+        const field = submittedIndexes[name];
+
+        if (existingIndexes[name] && field.__op !== 'Delete') {
+          throw new Parse.Error(
+            Parse.Error.INVALID_QUERY,
+            `Index ${name} exists, cannot update.`
+          );
+        }
+
+        if (!existingIndexes[name] && field.__op === 'Delete') {
+          throw new Parse.Error(
+            Parse.Error.INVALID_QUERY,
+            `Index ${name} does not exist, cannot delete.`
+          );
+        }
+
+        if (field.__op === 'Delete') {
+          deletedIndexes.push(name);
+          delete existingIndexes[name];
+        } else {
+          Object.keys(field).forEach(key => {
+            if (!Object.prototype.hasOwnProperty.call(fields, key)) {
+              throw new Parse.Error(
+                Parse.Error.INVALID_QUERY,
+                `Field ${key} does not exist, cannot add index.`
+              );
+            }
+          });
+
+          existingIndexes[name] = field;
+          insertedIndexes.push({
+            key: field,
+            name,
+          });
+        }
+      });
+
+      try {
+        if (insertedIndexes.length > 0) {
+          await this.createIndexes(className, insertedIndexes, connection);
+        }
+
+        if (deletedIndexes.length > 0) {
+          await this.dropIndexes(className, deletedIndexes, connection);
+        }
+
+        // 3. Обновляем схему в базе данных
+        const updateSchemaSql = `
+        UPDATE "_SCHEMA"
+        SET "schema" = JSON_MERGEPATCH(
+          "schema",
+          JSON_OBJECT('indexes' VALUE :indexes FORMAT JSON)
+        )
+        WHERE "className" = :className
+      `;
+
+        const result = await connection.execute(
+          updateSchemaSql,
+          {
+            className: className,
+            indexes: JSON.stringify(existingIndexes)
           }
-        });
-        existingIndexes[name] = field;
-        insertedIndexes.push({
-          key: field,
-          name,
-        });
+        );
+
+        if (result.rowsAffected === 0) {
+          throw new Error(`Class ${className} not found in schema`);
+        }
+
+        await connection.commit();
+
+        this._notifySchemaChange();
+
+      } catch (error) {
+        await connection.rollback();
+        throw error;
       }
-    });
-    await conn.tx('set-indexes-with-schema-format', async t => {
-      if (insertedIndexes.length > 0) {
-        await self.createIndexes(className, insertedIndexes, t);
+
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
       }
-      if (deletedIndexes.length > 0) {
-        await self.dropIndexes(className, deletedIndexes, t);
-      }
-      await t.none(
-        'UPDATE "_SCHEMA" SET $2:name = json_object_set_key($2:name, $3::text, $4::jsonb) WHERE "className" = $1',
-        [className, 'schema', 'indexes', JSON.stringify(existingIndexes)]
-      );
-    });
-    this._notifySchemaChange();
+    }
   }
 
-  async createClass(className: string, schema: SchemaType, conn: ?any) {
-    conn = conn || this._client;
-    const parseSchema = await conn
-      .tx('create-class', async t => {
-        await this.createTable(className, schema, t);
-        await t.none(
-          'INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass") VALUES ($<className>, $<schema>, true)',
-          { className, schema }
-        );
-        await this.setIndexesWithSchemaFormat(className, schema.indexes, {}, schema.fields, t);
-        return toParseSchema(schema);
-      })
-      .catch(err => {
-        if (err.code === OracleUniqueIndexViolationError && err.detail.includes(className)) {
-          throw new Parse.Error(Parse.Error.DUPLICATE_VALUE, `Class ${className} already exists.`);
-        }
-        throw err;
+  async createClass(className: string, schema: SchemaType, conn?: any) {
+    const connection = conn || await this._client.getConnection();
+    const shouldCloseConnection = !conn;
+
+    try {
+      await this.createTable(className, schema, connection);
+
+      const insertSql = `
+      INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass")
+      VALUES (:className, :schema, 1)
+    `;
+
+      await connection.execute(insertSql, {
+        className: className,
+        schema: JSON.stringify(schema)
       });
-    this._notifySchemaChange();
-    return parseSchema;
+
+      await this.setIndexesWithSchemaFormat(
+        className,
+        schema.indexes,
+        {},
+        schema.fields,
+        connection
+      );
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+      this._notifySchemaChange();
+
+      return toParseSchema(schema);
+
+    } catch (err) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+
+      if (err.errorNum === 1) {
+        const errorMessage = err.message || '';
+        if (errorMessage.includes(className) || errorMessage.includes('_SCHEMA_PK')) {
+          throw new Parse.Error(
+            Parse.Error.DUPLICATE_VALUE,
+            `Class ${className} already exists.`
+          );
+        }
+      }
+
+      throw err;
+
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
   // Just create a table, do not insert in schema
   async createTable(className: string, schema: SchemaType, conn: any) {
-    conn = conn || this._client;
-    debug('createTable');
-    const valuesArray = [];
-    const patternsArray = [];
+    const connection = conn || this._client;
+
+    debug('createTable', className);
+
     const fields = Object.assign({}, schema.fields);
+
     if (className === '_User') {
       fields._email_verify_token_expires_at = { type: 'Date' };
       fields._email_verify_token = { type: 'String' };
@@ -1049,192 +1292,383 @@ export class OracleStorageAdapter implements StorageAdapter {
       fields._password_changed_at = { type: 'Date' };
       fields._password_history = { type: 'Array' };
     }
-    let index = 2;
+
+    const columnDefinitions = [];
     const relations = [];
+
     Object.keys(fields).forEach(fieldName => {
       const parseType = fields[fieldName];
-      // Skip when it's a relation
-      // We'll create the tables later
+
       if (parseType.type === 'Relation') {
         relations.push(fieldName);
         return;
       }
-      if (['_rperm', '_wperm'].indexOf(fieldName) >= 0) {
+
+      if (fieldName === '_rperm' || fieldName === '_wperm') {
         parseType.contents = { type: 'String' };
       }
-      valuesArray.push(fieldName);
-      valuesArray.push(parseTypeToOracleType(parseType));
-      patternsArray.push(`$${index}:name $${index + 1}:raw`);
-      if (fieldName === 'objectId') {
-        patternsArray.push(`PRIMARY KEY ($${index}:name)`);
-      }
-      index = index + 2;
-    });
-    const qs = `CREATE TABLE IF NOT EXISTS $1:name (${patternsArray.join()})`;
-    const values = [className, ...valuesArray];
 
-    return conn.task('create-table', async t => {
+      const oracleType = parseTypeToOracleType(parseType);
+
+      columnDefinitions.push(`"${fieldName}" ${oracleType}`);
+
+      if (fieldName === 'objectId') {
+        columnDefinitions.push(`PRIMARY KEY ("${fieldName}")`);
+      }
+    });
+
+    const createTableSql = `
+      CREATE TABLE "${className}" (
+                                    ${columnDefinitions.join(',\n      ')}
+      )
+    `;
+
+    try {
+      await connection.execute(createTableSql);
+    } catch (error) {
+      // ORA-00955: name is already used by an existing object
+      if (error.errorNum === 955) {
+        // Таблица уже существует, игнорируем
+        console.log(`Table ${className} already exists, skipping creation`);
+      } else {
+        throw error;
+      }
+    }
+
+    // Создаем таблицы для Relations
+    for (const fieldName of relations) {
+      const joinTableName = `_Join:${fieldName}:${className}`;
+      const createJoinTableSql = `
+      CREATE TABLE "${joinTableName}" (
+        "relatedId" VARCHAR2(120),
+        "owningId" VARCHAR2(120),
+        PRIMARY KEY ("relatedId", "owningId")
+      )
+    `;
+
       try {
-        await t.none(qs, values);
+        await connection.execute(createJoinTableSql);
       } catch (error) {
-        if (error.code !== OracleDuplicateRelationError) {
+        if (error.errorNum === 955) {
+          console.log(`Join table ${joinTableName} already exists, skipping creation`);
+        } else {
           throw error;
         }
-        // ELSE: Table already exists, must have been created by a different request. Ignore the error.
       }
-      await t.tx('create-table-tx', tx => {
-        return tx.batch(
-          relations.map(fieldName => {
-            return tx.none(
-              'CREATE TABLE IF NOT EXISTS $<joinTable:name> ("relatedId" varChar(120), "owningId" varChar(120), PRIMARY KEY("relatedId", "owningId") )',
-              { joinTable: `_Join:${fieldName}:${className}` }
-            );
-          })
-        );
-      });
-    });
+    }
   }
 
+  /**
+   * Обновляет схему таблицы, добавляя новые колонки
+   * Самый простой и понятный вариант для Oracle
+   */
   async schemaUpgrade(className: string, schema: SchemaType, conn: any) {
-    debug('schemaUpgrade');
-    conn = conn || this._client;
-    const self = this;
+    debug('schemaUpgrade', className);
 
-    await conn.task('schema-upgrade', async t => {
-      const columns = await t.map(
-        'SELECT column_name FROM information_schema.columns WHERE table_name = $<className>',
-        { className },
-        a => a.column_name
+    const connection = conn || await this._client.getConnection();
+    const shouldCloseConnection = !conn;
+
+    try {
+      const result = await connection.execute(
+        `SELECT column_name 
+       FROM user_tab_columns 
+       WHERE table_name = :tableName`,
+        { tableName: className.toUpperCase() },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
-      const newColumns = Object.keys(schema.fields)
-        .filter(item => columns.indexOf(item) === -1)
-        .map(fieldName => self.addFieldIfNotExists(className, fieldName, schema.fields[fieldName]));
 
-      await t.batch(newColumns);
-    });
+      const existingColumns = result.rows.map(row => row.COLUMN_NAME);
+
+      const newFields = Object.keys(schema.fields).filter(
+        fieldName => !existingColumns.includes(fieldName.toUpperCase())
+      );
+
+      await Promise.all(
+        newFields.map(fieldName =>
+          this.addFieldIfNotExists(
+            className,
+            fieldName,
+            schema.fields[fieldName],
+            connection
+          )
+        )
+      );
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+      throw error;
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
-  async addFieldIfNotExists(className: string, fieldName: string, type: any) {
-    // TODO: Must be revised for invalid logic...
-    debug('addFieldIfNotExists');
-    const self = this;
-    await this._client.tx('add-field-if-not-exists', async t => {
+  async addFieldIfNotExists(
+    className: string,
+    fieldName: string,
+    type: any,
+    conn?: any
+  ) {
+    debug('addFieldIfNotExists', className, fieldName);
+
+    const connection = conn || await this._client.getConnection();
+    const shouldCloseConnection = !conn;
+
+    try {
       if (type.type !== 'Relation') {
+        const oracleType = parseTypeToOracleType(type);
+        const alterSql = `ALTER TABLE "${className}" ADD ("${fieldName}" ${oracleType})`;
+
         try {
-          await t.none(
-            'ALTER TABLE $<className:name> ADD COLUMN IF NOT EXISTS $<fieldName:name> $<OracleType:raw>',
-            {
-              className,
-              fieldName,
-              OracleType: parseTypeToOracleType(type),
-            }
-          );
+          await connection.execute(alterSql);
         } catch (error) {
-          if (error.code === OracleRelationDoesNotExistError) {
-            return self.createClass(className, { fields: { [fieldName]: type } }, t);
+          // ORA-00942: table or view does not exist
+          if (error.errorNum === 942) {
+            await this.createClass(
+              className,
+              { fields: { [fieldName]: type } },
+              connection
+            );
+            if (shouldCloseConnection) {
+              await connection.commit();
+            }
+            this._notifySchemaChange();
+            return;
           }
-          if (error.code !== OracleDuplicateColumnError) {
+
+          // ORA-01430: column being added already exists in table
+          if (error.errorNum !== 1430) {
             throw error;
           }
-          // Column already exists, created by other request. Carry on to see if it's the right type.
         }
+
       } else {
-        await t.none(
-          'CREATE TABLE IF NOT EXISTS $<joinTable:name> ("relatedId" varChar(120), "owningId" varChar(120), PRIMARY KEY("relatedId", "owningId") )',
-          { joinTable: `_Join:${fieldName}:${className}` }
-        );
+        // ===== Relation поле - создаем join таблицу =====
+
+        const joinTableName = `_Join:${fieldName}:${className}`;
+        const createJoinSql = `
+        CREATE TABLE "${joinTableName}" (
+          "relatedId" VARCHAR2(120),
+          "owningId" VARCHAR2(120),
+          PRIMARY KEY ("relatedId", "owningId")
+        )
+      `;
+
+        try {
+          await connection.execute(createJoinSql);
+        } catch (error) {
+          // ORA-00955: name is already used by an existing object
+          if (error.errorNum !== 955) {
+            throw error;
+          }
+        }
       }
 
-      const result = await t.any(
-        'SELECT "schema" FROM "_SCHEMA" WHERE "className" = $<className> and ("schema"::json->\'fields\'->$<fieldName>) is not null',
-        { className, fieldName }
+      const checkSql = `
+      SELECT "schema"
+      FROM "_SCHEMA"
+      WHERE "className" = :className
+        AND JSON_EXISTS("schema", '$.fields.${fieldName}')
+    `;
+
+      const checkResult = await connection.execute(
+        checkSql,
+        { className: className },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
-      if (result[0]) {
-        throw 'Attempted to add a field that already exists';
-      } else {
-        const path = `{fields,${fieldName}}`;
-        await t.none(
-          'UPDATE "_SCHEMA" SET "schema"=jsonb_set("schema", $<path>, $<type>)  WHERE "className"=$<className>',
-          { path, type, className }
-        );
+      if (checkResult.rows.length > 0) {
+        throw new Error('Attempted to add a field that already exists');
       }
-    });
-    this._notifySchemaChange();
+
+      const updateSql = `
+      UPDATE "_SCHEMA"
+      SET "schema" = JSON_MERGEPATCH(
+        "schema",
+        JSON_OBJECT(
+          'fields' VALUE JSON_MERGEPATCH(
+            JSON_QUERY("schema", '$.fields'),
+            JSON_OBJECT(:fieldName VALUE :fieldType FORMAT JSON)
+          ) FORMAT JSON
+        )
+      )
+      WHERE "className" = :className
+    `;
+
+      await connection.execute(updateSql, {
+        className: className,
+        fieldName: fieldName,
+        fieldType: JSON.stringify(type)
+      });
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+      this._notifySchemaChange();
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+      throw error;
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
   async updateFieldOptions(className: string, fieldName: string, type: any) {
-    await this._client.tx('update-schema-field-options', async t => {
-      const path = `{fields,${fieldName}}`;
-      await t.none(
-        'UPDATE "_SCHEMA" SET "schema"=jsonb_set("schema", $<path>, $<type>)  WHERE "className"=$<className>',
-        { path, type, className }
+    const connection = await this._client.getConnection();
+
+    try {
+      // Читаем схему
+      const result = await connection.execute(
+        `SELECT "schema" FROM "_SCHEMA" WHERE "className" = :className FOR UPDATE`,
+        { className },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
-    });
+
+      // Обновляем поле
+      const schema = JSON.parse(result.rows[0].schema);
+      if (!schema.fields) {
+        schema.fields = {};
+      }
+      schema.fields[fieldName] = type;
+
+      // Сохраняем
+      await connection.execute(
+        `UPDATE "_SCHEMA" SET "schema" = :schema WHERE "className" = :className`,
+        { className, schema: JSON.stringify(schema) }
+      );
+
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      await connection.close();
+    }
   }
 
   // Drops a collection. Resolves with true if it was a Parse Schema (eg. _User, Custom, etc.)
   // and resolves with false if it wasn't (eg. a join table). Rejects if deletion was impossible.
   async deleteClass(className: string) {
-    const operations = [
-      { query: `DROP TABLE IF EXISTS $1:name`, values: [className] },
-      {
-        query: `DELETE FROM "_SCHEMA" WHERE "className" = $1`,
-        values: [className],
-      },
-    ];
-    const response = await this._client
-      .tx(t => t.none(this._pgp.helpers.concat(operations)))
-      .then(() => className.indexOf('_Join:') != 0); // resolves with false when _Join table
+    const connection = await this._client.getConnection();
 
-    this._notifySchemaChange();
-    return response;
+    try {
+      const dropTableSql = `DROP TABLE "${className}" CASCADE CONSTRAINTS`;
+
+      try {
+        await connection.execute(dropTableSql);
+      } catch (error) {
+        // ORA-00942: table or view does not exist
+        if (error.errorNum !== 942) {
+          throw error;
+        }
+      }
+
+      const deleteSchemaSql = `DELETE FROM "_SCHEMA" WHERE "className" = :className`;
+
+      await connection.execute(deleteSchemaSql, {
+        className: className
+      });
+
+      await connection.commit();
+
+      this._notifySchemaChange();
+
+      // 5. Возвращаем true если это не Join таблица
+      return className.indexOf('_Join:') !== 0;
+
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      await connection.close();
+    }
   }
 
   // Delete all data known to this adapter. Used for testing.
   async deleteAllClasses() {
     const now = new Date().getTime();
-    const helpers = this._pgp.helpers;
     debug('deleteAllClasses');
-    if (this._client?.$pool.ended) {
+
+    if (this._client?.ended || this._client?._closing) {
       return;
     }
-    await this._client
-      .task('delete-all-classes', async t => {
-        try {
-          const results = await t.any('SELECT * FROM "_SCHEMA"');
-          const joins = results.reduce((list: Array<string>, schema: any) => {
-            return list.concat(joinTablesForSchema(schema.schema));
-          }, []);
-          const classes = [
-            '_SCHEMA',
-            '_PushStatus',
-            '_JobStatus',
-            '_JobSchedule',
-            '_Hooks',
-            '_GlobalConfig',
-            '_GraphQLConfig',
-            '_Audience',
-            '_Idempotency',
-            ...results.map(result => result.className),
-            ...joins,
-          ];
-          const queries = classes.map(className => ({
-            query: 'DROP TABLE IF EXISTS $<className:name>',
-            values: { className },
-          }));
-          await t.tx(tx => tx.none(helpers.concat(queries)));
-        } catch (error) {
-          if (error.code !== OracleRelationDoesNotExistError) {
-            throw error;
-          }
-          // No _SCHEMA collection. Don't delete anything.
+
+    const connection = await this._client.getConnection();
+
+    try {
+      let results;
+      try {
+        results = await connection.execute(
+          `SELECT * FROM "_SCHEMA"`,
+          {},
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+      } catch (error) {
+        // ORA-00942: table or view does not exist
+        if (error.errorNum === 942) {
+          // _SCHEMA не существует, нечего удалять
+          debug('_SCHEMA table does not exist, nothing to delete');
+          return;
         }
-      })
-      .then(() => {
-        debug(`deleteAllClasses done in ${new Date().getTime() - now}`);
-      });
+        throw error;
+      }
+
+      const joins = results.rows.reduce((list, row) => {
+        const schema = JSON.parse(row.schema);
+        return list.concat(joinTablesForSchema(schema));
+      }, []);
+
+      const classes = [
+        '_SCHEMA',
+        '_PushStatus',
+        '_JobStatus',
+        '_JobSchedule',
+        '_Hooks',
+        '_GlobalConfig',
+        '_GraphQLConfig',
+        '_Audience',
+        '_Idempotency',
+        ...results.rows.map(row => row.className),
+        ...joins,
+      ];
+
+      for (const className of classes) {
+        try {
+          await connection.execute(`DROP TABLE "${className}" CASCADE CONSTRAINTS`);
+          debug(`Dropped table: ${className}`);
+        } catch (error) {
+          // Игнорируем ошибку "таблица не существует"
+          if (error.errorNum !== 942) {
+            console.warn(`Warning: Could not drop table ${className}:`, error.message);
+          }
+        }
+      }
+
+      await connection.commit();
+
+      debug(`deleteAllClasses done in ${new Date().getTime() - now}ms`);
+
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      await connection.close();
+    }
   }
+
 
   // Remove the column and all the data. For Relations, the _Join collection is handled
   // specially, this function does not delete _Join columns. It should, however, indicate
@@ -1249,9 +1683,14 @@ export class OracleStorageAdapter implements StorageAdapter {
   // may do so.
 
   // Returns a Promise.
-  async deleteFields(className: string, schema: SchemaType, fieldNames: string[]): Promise<void> {
-    debug('deleteFields');
-    fieldNames = fieldNames.reduce((list: Array<string>, fieldName: string) => {
+  async deleteFields(
+    className: string,
+    schema: SchemaType,
+    fieldNames: string[]
+  ): Promise<void> {
+    debug('deleteFields', className, fieldNames);
+
+    const columnsToDelete = fieldNames.reduce((list, fieldName) => {
       const field = schema.fields[fieldName];
       if (field.type !== 'Relation') {
         list.push(fieldName);
@@ -1260,23 +1699,41 @@ export class OracleStorageAdapter implements StorageAdapter {
       return list;
     }, []);
 
-    const values = [className, ...fieldNames];
-    const columns = fieldNames
-      .map((name, idx) => {
-        return `$${idx + 2}:name`;
-      })
-      .join(', DROP COLUMN');
+    const connection = await this._client.getConnection();
 
-    await this._client.tx('delete-fields', async t => {
-      await t.none('UPDATE "_SCHEMA" SET "schema" = $<schema> WHERE "className" = $<className>', {
-        schema,
-        className,
-      });
-      if (values.length > 1) {
-        await t.none(`ALTER TABLE $1:name DROP COLUMN IF EXISTS ${columns}`, values);
+    try {
+      await connection.execute(
+        `UPDATE "_SCHEMA" SET "schema" = :schema WHERE "className" = :className`,
+        {
+          schema: JSON.stringify(schema),
+          className: className
+        }
+      );
+
+      if (columnsToDelete.length > 0) {
+        for (const fieldName of columnsToDelete) {
+          try {
+            await connection.execute(
+              `ALTER TABLE "${className}" DROP COLUMN "${fieldName}"`
+            );
+          } catch (error) {
+            // ORA-00904: invalid identifier (column does not exist)
+            if (error.errorNum !== 904) {
+              throw error;
+            }
+          }
+        }
       }
-    });
-    this._notifySchemaChange();
+
+      await connection.commit();
+      this._notifySchemaChange();
+
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      await connection.close();
+    }
   }
 
   // Return a promise for all schemas known to this adapter, in Parse format. In case the
@@ -1309,41 +1766,46 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
 
   // TODO: remove the mongo format dependency in the return value
+  /**
+   * Создает объект в базе данных
+   * Самый простой и понятный вариант для Oracle
+   */
   async createObject(
     className: string,
     schema: SchemaType,
     object: any,
-    transactionalSession: ?any
+    transactionalSession?: any
   ) {
-    debug('createObject');
-    let columnsArray = [];
+    debug('createObject', className);
+
+    const columnsArray = [];
     const valuesArray = [];
     schema = toOracleSchema(schema);
     const geoPoints = {};
 
     object = handleDotFields(object);
-
     validateKeys(object);
 
     Object.keys(object).forEach(fieldName => {
       if (object[fieldName] === null) {
         return;
       }
-      var authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
+
+      const authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
       const authDataAlreadyExists = !!object.authData;
       if (authDataMatch) {
-        var provider = authDataMatch[1];
+        const provider = authDataMatch[1];
         object['authData'] = object['authData'] || {};
         object['authData'][provider] = object[fieldName];
         delete object[fieldName];
         fieldName = 'authData';
-        // Avoid adding authData multiple times to the query
         if (authDataAlreadyExists) {
           return;
         }
       }
 
       columnsArray.push(fieldName);
+
       if (!schema.fields[fieldName] && className === '_User') {
         if (
           fieldName === '_email_verify_token' ||
@@ -1355,11 +1817,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
 
         if (fieldName === '_email_verify_token_expires_at') {
-          if (object[fieldName]) {
-            valuesArray.push(object[fieldName].iso);
-          } else {
-            valuesArray.push(null);
-          }
+          valuesArray.push(object[fieldName] ? object[fieldName].iso : null);
         }
 
         if (
@@ -1367,21 +1825,14 @@ export class OracleStorageAdapter implements StorageAdapter {
           fieldName === '_perishable_token_expires_at' ||
           fieldName === '_password_changed_at'
         ) {
-          if (object[fieldName]) {
-            valuesArray.push(object[fieldName].iso);
-          } else {
-            valuesArray.push(null);
-          }
+          valuesArray.push(object[fieldName] ? object[fieldName].iso : null);
         }
         return;
       }
+
       switch (schema.fields[fieldName].type) {
         case 'Date':
-          if (object[fieldName]) {
-            valuesArray.push(object[fieldName].iso);
-          } else {
-            valuesArray.push(null);
-          }
+          valuesArray.push(object[fieldName] ? object[fieldName].iso : null);
           break;
         case 'Pointer':
           valuesArray.push(object[fieldName].objectId);
@@ -1409,62 +1860,83 @@ export class OracleStorageAdapter implements StorageAdapter {
           break;
         }
         case 'GeoPoint':
-          // pop the point and process later
           geoPoints[fieldName] = object[fieldName];
           columnsArray.pop();
           break;
         default:
-          throw `Type ${schema.fields[fieldName].type} not supported yet`;
+          throw new Error(`Type ${schema.fields[fieldName].type} not supported yet`);
       }
     });
 
-    columnsArray = columnsArray.concat(Object.keys(geoPoints));
-    const initialValues = valuesArray.map((val, index) => {
-      let termination = '';
-      const fieldName = columnsArray[index];
-      if (['_rperm', '_wperm'].indexOf(fieldName) >= 0) {
-        termination = '::text[]';
-      } else if (schema.fields[fieldName] && schema.fields[fieldName].type === 'Array') {
-        termination = '::jsonb';
-      }
-      return `$${index + 2 + columnsArray.length}${termination}`;
+    const allColumns = [...columnsArray, ...Object.keys(geoPoints)];
+    const binds = {};
+
+    // Обычные значения
+    columnsArray.forEach((col, index) => {
+      const bindName = `val${index}`;
+      binds[bindName] = valuesArray[index];
     });
-    const geoPointsInjects = Object.keys(geoPoints).map(key => {
+
+    Object.keys(geoPoints).forEach((key, index) => {
       const value = geoPoints[key];
-      valuesArray.push(value.longitude, value.latitude);
-      const l = valuesArray.length + columnsArray.length;
-      return `POINT($${l}, $${l + 1})`;
+      binds[`geo${index}_lon`] = value.longitude;
+      binds[`geo${index}_lat`] = value.latitude;
     });
 
-    const columnsPattern = columnsArray.map((col, index) => `$${index + 2}:name`).join();
-    const valuesPattern = initialValues.concat(geoPointsInjects).join();
+    const columnsList = allColumns.map(col => `"${col}"`).join(', ');
 
-    const qs = `INSERT INTO $1:name (${columnsPattern}) VALUES (${valuesPattern})`;
-    const values = [className, ...columnsArray, ...valuesArray];
-    const promise = (transactionalSession ? transactionalSession.t : this._client)
-      .none(qs, values)
-      .then(() => ({ ops: [object] }))
-      .catch(error => {
-        if (error.code === OracleUniqueIndexViolationError) {
-          const err = new Parse.Error(
-            Parse.Error.DUPLICATE_VALUE,
-            'A duplicate value for a field with unique values was provided'
-          );
-          err.underlyingError = error;
-          if (error.constraint) {
-            const matches = error.constraint.match(/unique_([a-zA-Z]+)/);
-            if (matches && Array.isArray(matches)) {
-              err.userInfo = { duplicated_field: matches[1] };
-            }
+    const valuesList = [
+      ...columnsArray.map((col, i) => `:val${i}`),
+      ...Object.keys(geoPoints).map((key, i) =>
+        `SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:geo${i}_lon, :geo${i}_lat, NULL), NULL, NULL)`
+      )
+    ].join(', ');
+
+    const insertSql = `INSERT INTO "${className}" (${columnsList}) VALUES (${valuesList})`;
+
+    const connection = transactionalSession || await this._client.getConnection();
+    const shouldCloseConnection = !transactionalSession;
+
+    try {
+      await connection.execute(insertSql, binds);
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+      return { ops: [object] };
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+
+      // ORA-00001: unique constraint violated
+      if (error.errorNum === 1) {
+        const err = new Parse.Error(
+          Parse.Error.DUPLICATE_VALUE,
+          'A duplicate value for a field with unique values was provided'
+        );
+        err.underlyingError = error;
+
+        const constraintMatch = error.message.match(/\(([^.]+)\.([^)]+)\)/);
+        if (constraintMatch) {
+          const constraintName = constraintMatch[2];
+          const fieldMatch = constraintName.match(/unique_([a-zA-Z]+)/);
+          if (fieldMatch) {
+            err.userInfo = { duplicated_field: fieldMatch[1] };
           }
-          error = err;
         }
-        throw error;
-      });
-    if (transactionalSession) {
-      transactionalSession.batch.push(promise);
+        throw err;
+      }
+
+      throw error;
+
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
     }
-    return promise;
   }
 
   // Remove all objects that match the given Parse Query.
@@ -1474,41 +1946,59 @@ export class OracleStorageAdapter implements StorageAdapter {
     className: string,
     schema: SchemaType,
     query: QueryType,
-    transactionalSession: ?any
+    transactionalSession?: any
   ) {
-    debug('deleteObjectsByQuery');
-    const values = [className];
-    const index = 2;
-    const where = buildWhereClause({
-      schema,
-      index,
-      query,
-      caseInsensitive: false,
-    });
-    values.push(...where.values);
-    if (Object.keys(query).length === 0) {
-      where.pattern = 'TRUE';
+    debug('deleteObjectsByQuery', className);
+
+    const where = buildWhereClause({ schema, query, caseInsensitive: false });
+    const wherePattern = Object.keys(query).length === 0 ? '1=1' : where.pattern;
+
+    const connection = transactionalSession || await this._client.getConnection();
+    const shouldCloseConnection = !transactionalSession;
+
+    try {
+      const selectSql = `SELECT * FROM "${className}" WHERE ${wherePattern}`;
+      const selectResult = await connection.execute(
+        selectSql,
+        where.binds,
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      if (selectResult.rows.length === 0) {
+        throw new Parse.Error(
+          Parse.Error.OBJECT_NOT_FOUND,
+          'Object not found.'
+        );
+      }
+
+      const deleteSql = `DELETE FROM "${className}" WHERE ${wherePattern}`;
+      await connection.execute(deleteSql, where.binds);
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+      return {
+        count: selectResult.rows.length,
+        objects: selectResult.rows
+      };
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+
+      if (error.errorNum === 942) {
+        return { count: 0, objects: [] };
+      }
+
+      throw error;
+
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
     }
-    const qs = `WITH deleted AS (DELETE FROM $1:name WHERE ${where.pattern} RETURNING *) SELECT count(*) FROM deleted`;
-    const promise = (transactionalSession ? transactionalSession.t : this._client)
-      .one(qs, values, a => +a.count)
-      .then(count => {
-        if (count === 0) {
-          throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
-        } else {
-          return count;
-        }
-      })
-      .catch(error => {
-        if (error.code !== OracleRelationDoesNotExistError) {
-          throw error;
-        }
-        // ELSE: Don't delete anything if doesn't exist
-      });
-    if (transactionalSession) {
-      transactionalSession.batch.push(promise);
-    }
-    return promise;
   }
   // Return value not currently well specified.
   async findOneAndUpdate(
@@ -1525,39 +2015,37 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
 
   // Apply the update to all objects that match the given Parse Query.
+  /**
+   * Обновляет объекты по запросу
+   * Самый простой и понятный вариант для Oracle
+   */
   async updateObjectsByQuery(
     className: string,
     schema: SchemaType,
     query: QueryType,
     update: any,
-    transactionalSession: ?any
-  ): Promise<[any]> {
-    debug('updateObjectsByQuery');
-    const updatePatterns = [];
-    const values = [className];
-    let index = 2;
+    transactionalSession?: any
+  ): Promise<any[]> {
+    debug('updateObjectsByQuery', className);
+
     schema = toOracleSchema(schema);
-
     const originalUpdate = { ...update };
+    const binds = {};
+    let bindIndex = 0;
 
-    // Set flag for dot notation fields
+    const getBindName = () => `val${bindIndex++}`;
+
     const dotNotationOptions = {};
     Object.keys(update).forEach(fieldName => {
-      if (fieldName.indexOf('.') > -1) {
-        const components = fieldName.split('.');
-        const first = components.shift();
-        dotNotationOptions[first] = true;
-      } else {
-        dotNotationOptions[fieldName] = false;
-      }
+      dotNotationOptions[fieldName] = fieldName.indexOf('.') > -1;
     });
+
     update = handleDotFields(update);
-    // Resolve authData first,
-    // So we don't end up with multiple key updates
+
     for (const fieldName in update) {
       const authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
       if (authDataMatch) {
-        var provider = authDataMatch[1];
+        const provider = authDataMatch[1];
         const value = update[fieldName];
         delete update[fieldName];
         update['authData'] = update['authData'] || {};
@@ -1565,126 +2053,108 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
     }
 
+    const updatePatterns = [];
+
     for (const fieldName in update) {
       const fieldValue = update[fieldName];
-      // Drop any undefined values.
+
       if (typeof fieldValue === 'undefined') {
         delete update[fieldName];
-      } else if (fieldValue === null) {
-        updatePatterns.push(`$${index}:name = NULL`);
-        values.push(fieldName);
-        index += 1;
-      } else if (fieldName == 'authData') {
-        // This recursively sets the json_object
-        // Only 1 level deep
-        const generate = (jsonb: string, key: string, value: any) => {
-          return `json_object_set_key(COALESCE(${jsonb}, '{}'::jsonb), ${key}, ${value})::jsonb`;
-        };
-        const lastKey = `$${index}:name`;
-        const fieldNameIndex = index;
-        index += 1;
-        values.push(fieldName);
-        const update = Object.keys(fieldValue).reduce((lastKey: string, key: string) => {
-          const str = generate(lastKey, `$${index}::text`, `$${index + 1}::jsonb`);
-          index += 2;
-          let value = fieldValue[key];
-          if (value) {
-            if (value.__op === 'Delete') {
-              value = null;
-            } else {
-              value = JSON.stringify(value);
-            }
+        continue;
+      }
+
+      if (fieldValue === null) {
+        updatePatterns.push(`"${fieldName}" = NULL`);
+      }
+      else if (fieldName === 'authData') {
+        const authUpdates = [];
+        for (const key in fieldValue) {
+          const bindName = getBindName();
+          const value = fieldValue[key];
+          if (value && value.__op === 'Delete') {
+            binds[bindName] = null;
+          } else {
+            binds[bindName] = JSON.stringify(value);
           }
-          values.push(key, value);
-          return str;
-        }, lastKey);
-        updatePatterns.push(`$${fieldNameIndex}:name = ${update}`);
-      } else if (fieldValue.__op === 'Increment') {
-        updatePatterns.push(`$${index}:name = COALESCE($${index}:name, 0) + $${index + 1}`);
-        values.push(fieldName, fieldValue.amount);
-        index += 2;
-      } else if (fieldValue.__op === 'Add') {
+          authUpdates.push(`'${key}', ${value && value.__op === 'Delete' ? 'NULL' : `:${bindName}`}`);
+        }
         updatePatterns.push(
-          `$${index}:name = array_add(COALESCE($${index}:name, '[]'::jsonb), $${index + 1}::jsonb)`
+          `"${fieldName}" = JSON_MERGEPATCH(COALESCE("${fieldName}", '{}'), JSON_OBJECT(${authUpdates.join(', ')}))`
         );
-        values.push(fieldName, JSON.stringify(fieldValue.objects));
-        index += 2;
-      } else if (fieldValue.__op === 'Delete') {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, null);
-        index += 2;
-      } else if (fieldValue.__op === 'Remove') {
+      }
+      else if (fieldValue.__op === 'Increment') {
+        const bindName = getBindName();
+        binds[bindName] = fieldValue.amount;
+        updatePatterns.push(`"${fieldName}" = COALESCE("${fieldName}", 0) + :${bindName}`);
+      }
+      else if (fieldValue.__op === 'Add') {
+        const bindName = getBindName();
+        binds[bindName] = JSON.stringify(fieldValue.objects);
         updatePatterns.push(
-          `$${index}:name = array_remove(COALESCE($${index}:name, '[]'::jsonb), $${
-            index + 1
-          }::jsonb)`
+          `"${fieldName}" = array_add(COALESCE("${fieldName}", '[]'), :${bindName})`
         );
-        values.push(fieldName, JSON.stringify(fieldValue.objects));
-        index += 2;
-      } else if (fieldValue.__op === 'AddUnique') {
+      }
+      else if (fieldValue.__op === 'Delete') {
+        updatePatterns.push(`"${fieldName}" = NULL`);
+      }
+      else if (fieldValue.__op === 'Remove') {
+        const bindName = getBindName();
+        binds[bindName] = JSON.stringify(fieldValue.objects);
         updatePatterns.push(
-          `$${index}:name = array_add_unique(COALESCE($${index}:name, '[]'::jsonb), $${
-            index + 1
-          }::jsonb)`
+          `"${fieldName}" = array_remove(COALESCE("${fieldName}", '[]'), :${bindName})`
         );
-        values.push(fieldName, JSON.stringify(fieldValue.objects));
-        index += 2;
-      } else if (fieldName === 'updatedAt') {
-        //TODO: stop special casing this. It should check for __type === 'Date' and use .iso
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue);
-        index += 2;
-      } else if (typeof fieldValue === 'string') {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue);
-        index += 2;
-      } else if (typeof fieldValue === 'boolean') {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue);
-        index += 2;
-      } else if (fieldValue.__type === 'Pointer') {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue.objectId);
-        index += 2;
-      } else if (fieldValue.__type === 'Date') {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, toOracleValue(fieldValue));
-        index += 2;
-      } else if (fieldValue instanceof Date) {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue);
-        index += 2;
-      } else if (fieldValue.__type === 'File') {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, toOracleValue(fieldValue));
-        index += 2;
-      } else if (fieldValue.__type === 'GeoPoint') {
-        updatePatterns.push(`$${index}:name = POINT($${index + 1}, $${index + 2})`);
-        values.push(fieldName, fieldValue.longitude, fieldValue.latitude);
-        index += 3;
-      } else if (fieldValue.__type === 'Polygon') {
-        const value = convertPolygonToSQL(fieldValue.coordinates);
-        updatePatterns.push(`$${index}:name = $${index + 1}::polygon`);
-        values.push(fieldName, value);
-        index += 2;
-      } else if (fieldValue.__type === 'Relation') {
+      }
+      else if (fieldValue.__op === 'AddUnique') {
+        const bindName = getBindName();
+        binds[bindName] = JSON.stringify(fieldValue.objects);
+        updatePatterns.push(
+          `"${fieldName}" = array_add_unique(COALESCE("${fieldName}", '[]'), :${bindName})`
+        );
+      }
+      else if (fieldValue.__type === 'Pointer') {
+        const bindName = getBindName();
+        binds[bindName] = fieldValue.objectId;
+        updatePatterns.push(`"${fieldName}" = :${bindName}`);
+      }
+      else if (fieldValue.__type === 'Date') {
+        const bindName = getBindName();
+        binds[bindName] = toOracleValue(fieldValue);
+        updatePatterns.push(`"${fieldName}" = TO_TIMESTAMP(:${bindName}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`);
+      }
+      else if (fieldValue instanceof Date) {
+        const bindName = getBindName();
+        binds[bindName] = fieldValue.toISOString();
+        updatePatterns.push(`"${fieldName}" = TO_TIMESTAMP(:${bindName}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`);
+      }
+      else if (fieldValue.__type === 'File') {
+        const bindName = getBindName();
+        binds[bindName] = toOracleValue(fieldValue);
+        updatePatterns.push(`"${fieldName}" = :${bindName}`);
+      }
+      else if (fieldValue.__type === 'GeoPoint') {
+        const lonBind = getBindName();
+        const latBind = getBindName();
+        binds[lonBind] = fieldValue.longitude;
+        binds[latBind] = fieldValue.latitude;
+        updatePatterns.push(
+          `"${fieldName}" = SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonBind}, :${latBind}, NULL), NULL, NULL)`
+        );
+      }
+      else if (fieldValue.__type === 'Polygon') {
+        const bindName = getBindName();
+        binds[bindName] = convertPolygonToSQL(fieldValue.coordinates);
+        updatePatterns.push(`"${fieldName}" = :${bindName}`);
+      }
+      else if (fieldValue.__type === 'Relation') {
         // noop
-      } else if (typeof fieldValue === 'number') {
-        updatePatterns.push(`$${index}:name = $${index + 1}`);
-        values.push(fieldName, fieldValue);
-        index += 2;
-      } else if (
+      }
+      else if (
         typeof fieldValue === 'object' &&
         schema.fields[fieldName] &&
         schema.fields[fieldName].type === 'Object'
       ) {
-        // Gather keys to increment
         const keysToIncrement = Object.keys(originalUpdate)
           .filter(k => {
-            // choose top level fields that have a delete operation set
-            // Note that Object.keys is iterating over the **original** update object
-            // and that some of the keys of the original update could be null or undefined:
-            // (See the above check `if (fieldValue === null || typeof fieldValue == "undefined")`)
             const value = originalUpdate[k];
             return (
               value &&
@@ -1695,25 +2165,8 @@ export class OracleStorageAdapter implements StorageAdapter {
           })
           .map(k => k.split('.')[1]);
 
-        let incrementPatterns = '';
-        if (keysToIncrement.length > 0) {
-          incrementPatterns =
-            ' || ' +
-            keysToIncrement
-              .map(c => {
-                const amount = fieldValue[c].amount;
-                return `CONCAT('{"${c}":', COALESCE($${index}:name->>'${c}','0')::int + ${amount}, '}')::jsonb`;
-              })
-              .join(' || ');
-          // Strip the keys
-          keysToIncrement.forEach(key => {
-            delete fieldValue[key];
-          });
-        }
-
-        const keysToDelete: Array<string> = Object.keys(originalUpdate)
+        const keysToDelete = Object.keys(originalUpdate)
           .filter(k => {
-            // choose top level fields that have a delete operation set.
             const value = originalUpdate[k];
             return (
               value &&
@@ -1724,64 +2177,101 @@ export class OracleStorageAdapter implements StorageAdapter {
           })
           .map(k => k.split('.')[1]);
 
-        const deletePatterns = keysToDelete.reduce((p: string, c: string, i: number) => {
-          return p + ` - '$${index + 1 + i}:value'`;
-        }, '');
-        // Override Object
-        let updateObject = "'{}'::jsonb";
+        keysToIncrement.forEach(key => delete fieldValue[key]);
 
-        if (dotNotationOptions[fieldName]) {
-          // Merge Object
-          updateObject = `COALESCE($${index}:name, '{}'::jsonb)`;
-        }
-        updatePatterns.push(
-          `$${index}:name = (${updateObject} ${deletePatterns} ${incrementPatterns} || $${
-            index + 1 + keysToDelete.length
-          }::jsonb )`
-        );
-        values.push(fieldName, ...keysToDelete, JSON.stringify(fieldValue));
-        index += 2 + keysToDelete.length;
-      } else if (
+        const bindName = getBindName();
+        binds[bindName] = JSON.stringify(fieldValue);
+
+        let updateExpr = dotNotationOptions[fieldName]
+          ? `COALESCE("${fieldName}", '{}')`
+          : `'{}'`;
+
+        keysToDelete.forEach(key => {
+          updateExpr = `JSON_REMOVE(${updateExpr}, '$.${key}')`;
+        });
+
+        keysToIncrement.forEach(key => {
+          const amount = originalUpdate[`${fieldName}.${key}`].amount;
+          updateExpr = `JSON_SET(${updateExpr}, '$.${key}', JSON_EXTRACT(${updateExpr}, '$.${key}') + ${amount})`;
+        });
+
+        updatePatterns.push(`"${fieldName}" = JSON_MERGEPATCH(${updateExpr}, :${bindName})`);
+      }
+      else if (
         Array.isArray(fieldValue) &&
         schema.fields[fieldName] &&
         schema.fields[fieldName].type === 'Array'
       ) {
-        const expectedType = parseTypeToOracleType(schema.fields[fieldName]);
-        if (expectedType === 'text[]') {
-          updatePatterns.push(`$${index}:name = $${index + 1}::text[]`);
-          values.push(fieldName, fieldValue);
-          index += 2;
-        } else {
-          updatePatterns.push(`$${index}:name = $${index + 1}::jsonb`);
-          values.push(fieldName, JSON.stringify(fieldValue));
-          index += 2;
-        }
-      } else {
+        const bindName = getBindName();
+        binds[bindName] = JSON.stringify(fieldValue);
+        updatePatterns.push(`"${fieldName}" = :${bindName}`);
+      }
+      else if (
+        typeof fieldValue === 'string' ||
+        typeof fieldValue === 'number' ||
+        typeof fieldValue === 'boolean'
+      ) {
+        const bindName = getBindName();
+        binds[bindName] = fieldValue;
+        updatePatterns.push(`"${fieldName}" = :${bindName}`);
+      }
+      else {
         debug('Not supported update', { fieldName, fieldValue });
-        return Promise.reject(
-          new Parse.Error(
-            Parse.Error.OPERATION_FORBIDDEN,
-            `Oracle doesn't support update ${JSON.stringify(fieldValue)} yet`
-          )
+        throw new Parse.Error(
+          Parse.Error.OPERATION_FORBIDDEN,
+          `Oracle doesn't support update ${JSON.stringify(fieldValue)} yet`
         );
       }
     }
 
     const where = buildWhereClause({
       schema,
-      index,
       query,
       caseInsensitive: false,
     });
-    values.push(...where.values);
+
+    Object.assign(binds, where.binds);
 
     const whereClause = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
-    const qs = `UPDATE $1:name SET ${updatePatterns.join()} ${whereClause} RETURNING *`;
-    const promise = (transactionalSession ? transactionalSession.t : this._client).any(qs, values);
-    if (transactionalSession) {
-      transactionalSession.batch.push(promise);
+
+    const connection = transactionalSession || await this._client.getConnection();
+    const shouldCloseConnection = !transactionalSession;
+
+    try {
+      const selectSql = `SELECT * FROM "${className}" ${whereClause}`;
+      const selectResult = await connection.execute(
+        selectSql,
+        binds,
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      if (updatePatterns.length > 0) {
+        const updateSql = `UPDATE "${className}" SET ${updatePatterns.join(', ')} ${whereClause}`;
+        await connection.execute(updateSql, binds);
+      }
+
+      const updatedResult = await connection.execute(
+        selectSql,
+        binds,
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+      return updatedResult.rows;
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+      throw error;
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
     }
-    return promise;
   }
 
   // Hopefully, we can get rid of this. It's only used for config and hooks.
@@ -1803,101 +2293,78 @@ export class OracleStorageAdapter implements StorageAdapter {
     });
   }
 
-  find(
-    className: string,
-    schema: SchemaType,
-    query: QueryType,
-    { skip, limit, sort, keys, caseInsensitive, explain }: QueryOptions
-  ) {
-    debug('find');
-    const hasLimit = limit !== undefined;
-    const hasSkip = skip !== undefined;
-    let values = [className];
-    const where = buildWhereClause({
-      schema,
-      query,
-      index: 2,
-      caseInsensitive,
-    });
-    values.push(...where.values);
-    const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
-    const limitPattern = hasLimit ? `LIMIT $${values.length + 1}` : '';
-    if (hasLimit) {
-      values.push(limit);
-    }
-    const skipPattern = hasSkip ? `OFFSET $${values.length + 1}` : '';
-    if (hasSkip) {
-      values.push(skip);
-    }
+  async find(className, schema, query, options) {
+    debug('find', className);
 
+    const { skip, limit, sort, keys, caseInsensitive, explain } = options;
+
+    const where = buildWhereClause({ schema, query, caseInsensitive });
+    const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
+
+    // Сортировка
     let sortPattern = '';
-    if (sort) {
-      const sortCopy: any = sort;
+    if (sort && Object.keys(sort).length > 0) {
       const sorting = Object.keys(sort)
-        .map(key => {
-          const transformKey = transformDotFieldToComponents(key).join('->');
-          // Using $idx pattern gives:  non-integer constant in ORDER BY
-          if (sortCopy[key] === 1) {
-            return `${transformKey} ASC`;
-          }
-          return `${transformKey} DESC`;
-        })
-        .join();
-      sortPattern = sort !== undefined && Object.keys(sort).length > 0 ? `ORDER BY ${sorting}` : '';
+        .map(key => `"${key}" ${sort[key] === 1 ? 'ASC' : 'DESC'}`)
+        .join(', ');
+      sortPattern = `ORDER BY ${sorting}`;
     }
-    if (where.sorts && Object.keys((where.sorts: any)).length > 0) {
-      sortPattern = `ORDER BY ${where.sorts.join()}`;
+    if (where.sorts?.length > 0) {
+      sortPattern = `ORDER BY ${where.sorts.join(', ')}`;
     }
 
+    // Колонки
     let columns = '*';
     if (keys) {
-      // Exclude empty keys
-      // Replace ACL by it's keys
-      keys = keys.reduce((memo, key) => {
+      const filteredKeys = keys.reduce((memo, key) => {
         if (key === 'ACL') {
-          memo.push('_rperm');
-          memo.push('_wperm');
-        } else if (
-          key.length > 0 &&
-          // Remove selected field not referenced in the schema
-          // Relation is not a column in Oracle
-          // $score is a Parse special field and is also not a column
-          ((schema.fields[key] && schema.fields[key].type !== 'Relation') || key === '$score')
-        ) {
+          memo.push('_rperm', '_wperm');
+        } else if (key.length > 0 &&
+          ((schema.fields[key] && schema.fields[key].type !== 'Relation') ||
+            key === '$score')) {
           memo.push(key);
         }
         return memo;
       }, []);
-      columns = keys
-        .map((key, index) => {
-          if (key === '$score') {
-            return `ts_rank_cd(to_tsvector($${2}, $${3}:name), to_tsquery($${4}, $${5}), 32) as score`;
-          }
-          return `$${index + values.length + 1}:name`;
-        })
-        .join();
-      values = values.concat(keys);
+
+      columns = filteredKeys
+        .map(key => key === '$score' ? 'SCORE(1) as score' : `"${key}"`)
+        .join(', ');
     }
 
-    const originalQuery = `SELECT ${columns} FROM $1:name ${wherePattern} ${sortPattern} ${limitPattern} ${skipPattern}`;
-    const qs = explain ? this.createExplainableQuery(originalQuery) : originalQuery;
-    return this._client
-      .any(qs, values)
-      .catch(error => {
-        // Query on non existing table, don't crash
-        if (error.code !== OracleRelationDoesNotExistError) {
-          throw error;
-        }
-        return [];
-      })
-      .then(results => {
-        if (explain) {
-          return results;
-        }
-        return results.map(object => this.OracleObjectToParseObject(className, object, schema));
-      });
-  }
+    // Пагинация
+    let paginationPattern = '';
+    if (skip !== undefined || limit !== undefined) {
+      const offsetValue = skip || 0;
+      paginationPattern = limit !== undefined
+        ? `OFFSET ${offsetValue} ROWS FETCH NEXT ${limit} ROWS ONLY`
+        : `OFFSET ${offsetValue} ROWS`;
+    }
 
+    const query = `SELECT ${columns} FROM "${className}" ${wherePattern} ${sortPattern} ${paginationPattern}`.trim();
+
+    const connection = await this._client.getConnection();
+
+    try {
+      const result = await connection.execute(
+        explain ? this.createExplainableQuery(query) : query,
+        where.binds || {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      if (explain) return result.rows;
+
+      return result.rows.map(obj =>
+        this.OracleObjectToParseObject(className, obj, schema)
+      );
+
+    } catch (error) {
+      if (error.errorNum === 942) return [];
+      throw error;
+    } finally {
+      await connection.close();
+    }
+  }
   // Converts from a Oracle-format object to a REST-format object.
   // Does not strip out anything based on a lack of authentication.
   OracleObjectToParseObject(className: string, object: any, schema: any) {
@@ -1999,25 +2466,52 @@ export class OracleStorageAdapter implements StorageAdapter {
   // Way of determining if a field is nullable. Undefined doesn't count against uniqueness,
   // which is why we use sparse indexes.
   async ensureUniqueness(className: string, schema: SchemaType, fieldNames: string[]) {
+    debug('ensureUniqueness', className, fieldNames);
+
     const constraintName = `${className}_unique_${fieldNames.sort().join('_')}`;
-    const constraintPatterns = fieldNames.map((fieldName, index) => `$${index + 3}:name`);
-    const qs = `CREATE UNIQUE INDEX IF NOT EXISTS $2:name ON $1:name(${constraintPatterns.join()})`;
-    return this._client.none(qs, [className, constraintName, ...fieldNames]).catch(error => {
-      if (error.code === OracleDuplicateRelationError && error.message.includes(constraintName)) {
-        // Index already exists. Ignore error.
-      } else if (
-        error.code === OracleUniqueIndexViolationError &&
-        error.message.includes(constraintName)
-      ) {
-        // Cast the error into the proper parse error
+    const connection = await this._client.getConnection();
+
+    try {
+      const checkSql = `
+      SELECT COUNT(*) as cnt
+      FROM user_indexes
+      WHERE index_name = :indexName
+    `;
+
+      const checkResult = await connection.execute(
+        checkSql,
+        { indexName: constraintName.toUpperCase() },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      if (checkResult.rows[0].CNT > 0) {
+        debug(`Index ${constraintName} already exists`);
+        return;
+      }
+
+      const columnsList = fieldNames.map(field => `"${field}"`).join(', ');
+      const createIndexSql = `CREATE UNIQUE INDEX "${constraintName}" ON "${className}" (${columnsList})`;
+
+      await connection.execute(createIndexSql);
+      await connection.commit();
+
+      debug(`Created unique index: ${constraintName}`);
+
+    } catch (error) {
+      await connection.rollback();
+
+      if (error.errorNum === 1) {
         throw new Parse.Error(
           Parse.Error.DUPLICATE_VALUE,
           'A duplicate value for a field with unique values was provided'
         );
-      } else {
-        throw error;
       }
-    });
+
+      throw error;
+
+    } finally {
+      await connection.close();
+    }
   }
 
   // Executes a count.
@@ -2026,41 +2520,50 @@ export class OracleStorageAdapter implements StorageAdapter {
     schema: SchemaType,
     query: QueryType,
     readPreference?: string,
-    estimate?: boolean = true
+    estimate: boolean = true
   ) {
-    debug('count');
-    const values = [className];
-    const where = buildWhereClause({
-      schema,
-      query,
-      index: 2,
-      caseInsensitive: false,
-    });
-    values.push(...where.values);
+    debug('count', className);
 
-    const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
-    let qs = '';
+    const where = buildWhereClause({ schema, query, caseInsensitive: false });
+    const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
 
-    if (where.pattern.length > 0 || !estimate) {
-      qs = `SELECT count(*) FROM $1:name ${wherePattern}`;
-    } else {
-      qs = 'SELECT reltuples AS approximate_row_count FROM pg_class WHERE relname = $1';
+    const connection = await this._client.getConnection();
+
+    try {
+      let sql;
+      let binds;
+
+      if (where.pattern || !estimate) {
+        // Точный подсчет
+        sql = `SELECT COUNT(*) as cnt FROM "${className}" ${wherePattern}`;
+        binds = where.binds || {};
+      } else {
+        // Быстрая оценка
+        sql = `
+        SELECT num_rows as approximate_row_count
+        FROM user_tables
+        WHERE table_name = :tableName
+      `;
+        binds = { tableName: className.toUpperCase() };
+      }
+
+      const result = await connection.execute(
+        sql,
+        binds,
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      if (result.rows.length === 0) return 0;
+
+      const row = result.rows[0];
+      return Number(row.APPROXIMATE_ROW_COUNT || row.CNT) || 0;
+
+    } catch (error) {
+      if (error.errorNum === 942) return 0;
+      throw error;
+    } finally {
+      await connection.close();
     }
-
-    return this._client
-      .one(qs, values, a => {
-        if (a.approximate_row_count == null || a.approximate_row_count == -1) {
-          return !isNaN(+a.count) ? +a.count : 0;
-        } else {
-          return +a.approximate_row_count;
-        }
-      })
-      .catch(error => {
-        if (error.code !== OracleRelationDoesNotExistError) {
-          throw error;
-        }
-        return 0;
-      });
   }
 
   async distinct(className: string, schema: SchemaType, query: QueryType, fieldName: string) {
@@ -2256,9 +2759,9 @@ export class OracleStorageAdapter implements StorageAdapter {
             field = 'objectId';
           }
           const matchPatterns = [];
-          Object.keys(ParseToPosgresComparator).forEach(cmp => {
+          Object.keys(ParseToOracleComparator).forEach(cmp => {
             if (value[cmp]) {
-              const pgComparator = ParseToPosgresComparator[cmp];
+              const pgComparator = ParseToOracleComparator[cmp];
               matchPatterns.push(`$${index}:name ${pgComparator} $${index + 1}`);
               values.push(field, toOracleValue(value[cmp]));
               index += 2;
@@ -2668,8 +3171,8 @@ function literalizeRegexPart(s: string) {
   );
 }
 
-var GeoPointCoder = {
-  isValidJSON(value) {
+const GeoPointCoder = {
+  isValidJSON(value): boolean {
     return typeof value === 'object' && value !== null && value.__type === 'GeoPoint';
   },
 };
