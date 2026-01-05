@@ -30,27 +30,31 @@ const debug = function (...args: any) {
 const parseTypeToOracleType = type => {
   switch (type.type) {
     case 'String':
-      return 'VARCHAR(32767)';
+      return 'text';
     case 'Date':
-      return 'TIMESTAMP WITH TIME ZONE';
+      return 'timestamp with time zone';
     case 'Object':
-      return 'JSON';
+      return 'jsonb';
     case 'File':
-      return 'CLOB';
+      return 'text';
     case 'Boolean':
-      return 'BOOLEAN';
+      return 'boolean';
     case 'Pointer':
-      return 'VARCHAR(32767)';
+      return 'text';
     case 'Number':
-      return 'DOUBLE PRECISION';
+      return 'double precision';
     case 'GeoPoint':
-      return 'SDO_GEOMETRY';
+      return 'point';
     case 'Bytes':
-      return 'JSON';
+      return 'jsonb';
     case 'Polygon':
-      return 'SDO_GEOMETRY';
+      return 'polygon';
     case 'Array':
-      return JSON;
+      if (type.contents && type.contents.type === 'String') {
+        return 'text[]';
+      } else {
+        return 'jsonb';
+      }
     default:
       throw `no type for ${JSON.stringify(type)} yet`;
   }
@@ -64,18 +68,18 @@ const ParseToOracleComparator = {
 };
 
 const mongoAggregateToOracle = {
-  $dayOfMonth: 'DD',
-  $dayOfWeek: 'D',
-  $dayOfYear: 'DDD',
-  $isoDayOfWeek: 'ID',
-  $isoWeekYear: 'IYYY',
-  $hour: 'HH24',
-  $minute: 'MI',
-  $second: 'SS',
-  $millisecond: 'FF3',
-  $month: 'MM',
-  $week: 'IW',
-  $year: 'YYYY',
+  $dayOfMonth: 'DAY',
+  $dayOfWeek: 'DOW',
+  $dayOfYear: 'DOY',
+  $isoDayOfWeek: 'ISODOW',
+  $isoWeekYear: 'ISOYEAR',
+  $hour: 'HOUR',
+  $minute: 'MINUTE',
+  $second: 'SECOND',
+  $millisecond: 'MILLISECONDS',
+  $month: 'MONTH',
+  $week: 'WEEK',
+  $year: 'YEAR',
 };
 
 const toOracleValue = value => {
@@ -95,10 +99,10 @@ const toOracleValueCastType = value => {
   let castType;
   switch (typeof OracleValue) {
     case 'number':
-      castType = 'DOUBLE PRECISION';
+      castType = 'double precision';
       break;
     case 'boolean':
-      castType = 'BOOLEAN';
+      castType = 'boolean';
       break;
     default:
       castType = undefined;
@@ -174,7 +178,7 @@ const toOracleSchema = schema => {
   return schema;
 };
 
-const isArrayIndex = arrayIndex => Array.from(arrayIndex).every(c => c >= '0' && c <= '9');
+const isArrayIndex = (arrayIndex) => Array.from(arrayIndex).every(c => c >= '0' && c <= '9');
 
 const handleDotFields = object => {
   Object.keys(object).forEach(fieldName => {
@@ -3156,19 +3160,17 @@ function literalizeRegexPart(s: string) {
   }
 
   // Remove problematic chars from remaining text
-  return (
-    s
-      // Remove all instances of \Q and \E
-      .replace(/([^\\])(\\E)/, '$1')
-      .replace(/([^\\])(\\Q)/, '$1')
-      .replace(/^\\E/, '')
-      .replace(/^\\Q/, '')
-      // Ensure even number of single quote sequences by adding an extra single quote if needed;
-      // this ensures that every single quote is escaped
-      .replace(/'+/g, match => {
-        return match.length % 2 === 0 ? match : match + "'";
-      })
-  );
+  return s
+    // Remove all instances of \Q and \E
+    .replace(/([^\\])(\\E)/, '$1')
+    .replace(/([^\\])(\\Q)/, '$1')
+    .replace(/^\\E/, '')
+    .replace(/^\\Q/, '')
+    // Ensure even number of single quote sequences by adding an extra single quote if needed;
+    // this ensures that every single quote is escaped
+    .replace(/'+/g, match => {
+      return match.length % 2 === 0 ? match : match + "'";
+    });
 }
 
 const GeoPointCoder = {
