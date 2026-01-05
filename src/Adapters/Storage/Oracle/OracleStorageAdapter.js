@@ -30,31 +30,27 @@ const debug = function (...args: any) {
 const parseTypeToOracleType = type => {
   switch (type.type) {
     case 'String':
-      return 'text';
+      return 'VARCHAR(32767)';
     case 'Date':
-      return 'timestamp with time zone';
+      return 'TIMESTAMP WITH TIME ZONE';
     case 'Object':
-      return 'jsonb';
+      return 'JSON';
     case 'File':
-      return 'text';
+      return 'CLOB';
     case 'Boolean':
-      return 'boolean';
+      return 'BOOLEAN';
     case 'Pointer':
-      return 'text';
+      return 'VARCHAR(32767)';
     case 'Number':
-      return 'double precision';
+      return 'DOUBLE PRECISION';
     case 'GeoPoint':
-      return 'point';
+      return 'SDO_GEOMETRY';
     case 'Bytes':
-      return 'jsonb';
+      return 'JSON';
     case 'Polygon':
-      return 'polygon';
+      return 'SDO_GEOMETRY';
     case 'Array':
-      if (type.contents && type.contents.type === 'String') {
-        return 'text[]';
-      } else {
-        return 'jsonb';
-      }
+      return JSON;
     default:
       throw `no type for ${JSON.stringify(type)} yet`;
   }
@@ -68,18 +64,18 @@ const ParseToOracleComparator = {
 };
 
 const mongoAggregateToOracle = {
-  $dayOfMonth: 'DAY',
-  $dayOfWeek: 'DOW',
-  $dayOfYear: 'DOY',
-  $isoDayOfWeek: 'ISODOW',
-  $isoWeekYear: 'ISOYEAR',
-  $hour: 'HOUR',
-  $minute: 'MINUTE',
-  $second: 'SECOND',
-  $millisecond: 'MILLISECONDS',
-  $month: 'MONTH',
-  $week: 'WEEK',
-  $year: 'YEAR',
+  $dayOfMonth: 'DD',
+  $dayOfWeek: 'D',
+  $dayOfYear: 'DDD',
+  $isoDayOfWeek: 'ID',
+  $isoWeekYear: 'IYYY',
+  $hour: 'HH24',
+  $minute: 'MI',
+  $second: 'SS',
+  $millisecond: 'FF3',
+  $month: 'MM',
+  $week: 'IW',
+  $year: 'YYYY',
 };
 
 const toOracleValue = value => {
@@ -99,10 +95,10 @@ const toOracleValueCastType = value => {
   let castType;
   switch (typeof OracleValue) {
     case 'number':
-      castType = 'double precision';
+      castType = 'DOUBLE PRECISION';
       break;
     case 'boolean':
-      castType = 'boolean';
+      castType = 'BOOLEAN';
       break;
     default:
       castType = undefined;
@@ -178,7 +174,7 @@ const toOracleSchema = schema => {
   return schema;
 };
 
-const isArrayIndex = (arrayIndex) => Array.from(arrayIndex).every(c => c >= '0' && c <= '9');
+const isArrayIndex = arrayIndex => Array.from(arrayIndex).every(c => c >= '0' && c <= '9');
 
 const handleDotFields = object => {
   Object.keys(object).forEach(fieldName => {
@@ -1055,11 +1051,11 @@ export class OracleStorageAdapter implements StorageAdapter {
     await conn
       .none(
         'CREATE TABLE "_SCHEMA" (\n' +
-          '      "className" VARCHAR2(120),\n' +
-          '      "schema" JSON,\n' +
-          '      "isParseClass" NUMBER(1),\n' +
-          '      CONSTRAINT "_SCHEMA_PK" PRIMARY KEY ("className")\n' +
-          '    )'
+        '      "className" VARCHAR2(120),\n' +
+        '      "schema" JSON,\n' +
+        '      "isParseClass" NUMBER(1),\n' +
+        '      CONSTRAINT "_SCHEMA_PK" PRIMARY KEY ("className")\n' +
+        '    )'
       )
       .catch(error => {
         throw error;
@@ -3160,17 +3156,19 @@ function literalizeRegexPart(s: string) {
   }
 
   // Remove problematic chars from remaining text
-  return s
-    // Remove all instances of \Q and \E
-    .replace(/([^\\])(\\E)/, '$1')
-    .replace(/([^\\])(\\Q)/, '$1')
-    .replace(/^\\E/, '')
-    .replace(/^\\Q/, '')
-    // Ensure even number of single quote sequences by adding an extra single quote if needed;
-    // this ensures that every single quote is escaped
-    .replace(/'+/g, match => {
-      return match.length % 2 === 0 ? match : match + "'";
-    });
+  return (
+    s
+      // Remove all instances of \Q and \E
+      .replace(/([^\\])(\\E)/, '$1')
+      .replace(/([^\\])(\\Q)/, '$1')
+      .replace(/^\\E/, '')
+      .replace(/^\\Q/, '')
+      // Ensure even number of single quote sequences by adding an extra single quote if needed;
+      // this ensures that every single quote is escaped
+      .replace(/'+/g, match => {
+        return match.length % 2 === 0 ? match : match + "'";
+      })
+  );
 }
 
 const GeoPointCoder = {
