@@ -1,32 +1,50 @@
 'use strict';
-
-var QueryFile = require('pg-promise').QueryFile;
-var path = require('path');
+const fs = require('fs');
+const path = require('path');
 
 module.exports = {
   array: {
-    add: sql('array/add.sql'),
-    addUnique: sql('array/add-unique.sql'),
-    contains: sql('array/contains.sql'),
-    containsAll: sql('array/contains-all.sql'),
-    containsAllRegex: sql('array/contains-all-regex.sql'),
-    remove: sql('array/remove.sql'),
+    add: loadSQL('array/add.sql'),
+    addUnique: loadSQL('array/add-unique.sql'),
+    contains: loadSQL('array/contains.sql'),
+    containsAll: loadSQL('array/contains-all.sql'),
+    containsAllRegex: loadSQL('array/contains-all-regex.sql'),
+    remove: loadSQL('array/remove.sql'),
   },
   misc: {
-    jsonObjectSetKeys: sql('misc/json-object-set-keys.sql'),
+    jsonObjectSetKeys: loadSQL('misc/json-object-set-keys.sql'),
   },
 };
 
-///////////////////////////////////////////////
-// Helper for linking to external query files;
-function sql(file) {
-  var fullPath = path.join(__dirname, file); // generating full path;
+/**
+ * @param {string} file - filepath of the SQL file relative to this module
+ * @returns {string} - SQL file content
+ */
+function loadSQL(file) {
+  try {
+    const fullPath = path.join(__dirname, file);
+    const sql = fs.readFileSync(fullPath, 'utf8');
 
-  var qf = new QueryFile(fullPath, { minify: true });
-
-  if (qf.error) {
-    throw qf.error;
+    // Минифицируем SQL (убираем лишние пробелы и комментарии)
+    return minifySQL(sql);
+  } catch (error) {
+    console.error(`Error loading SQL file: ${file}`, error);
+    throw error;
   }
+}
 
-  return qf;
+/**
+ * @param {string} sql - source SQL
+ * @returns {string} - minified SQL
+ */
+function minifySQL(sql) {
+  return sql
+    // Удаляем однострочные комментарии
+    .replace(/--.*$/gm, '')
+    // Удаляем многострочные комментарии
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    // Удаляем лишние пробелы и переносы строк
+    .replace(/\s+/g, ' ')
+    // Убираем пробелы в начале и конце
+    .trim();
 }

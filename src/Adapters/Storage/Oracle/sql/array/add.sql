@@ -1,11 +1,33 @@
 CREATE OR REPLACE FUNCTION array_add(
-  "array"   jsonb,
-  "values"  jsonb
+  p_array   CLOB,
+  p_values  CLOB
 )
-  RETURNS jsonb
-  LANGUAGE sql
-  IMMUTABLE
-  STRICT
-AS $function$
-  SELECT array_to_json(ARRAY(SELECT unnest(ARRAY(SELECT DISTINCT jsonb_array_elements("array")) ||  ARRAY(SELECT jsonb_array_elements("values")))))::jsonb;
-$function$;
+RETURN CLOB
+IS
+  l_result CLOB;
+BEGIN
+SELECT JSON_ARRAYAGG(
+               JSON_VALUE(value, '$') FORMAT JSON
+           ORDER BY value
+       )
+INTO l_result
+FROM (
+         SELECT DISTINCT value
+         FROM (
+                  -- Элементы из первого массива
+                  SELECT COLUMN_VALUE as value
+                  FROM JSON_TABLE(p_array, '$[*]'
+                      COLUMNS (COLUMN_VALUE VARCHAR2(4000) PATH '$'))
+
+                  UNION
+
+                  -- Элементы из второго массива
+                  SELECT COLUMN_VALUE as value
+                  FROM JSON_TABLE(p_values, '$[*]'
+                      COLUMNS (COLUMN_VALUE VARCHAR2(4000) PATH '$'))
+              )
+     );
+
+RETURN l_result;
+END array_add;
+/
