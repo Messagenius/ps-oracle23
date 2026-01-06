@@ -2275,7 +2275,7 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
 
   // Hopefully, we can get rid of this. It's only used for config and hooks.
-  upsertOneObject(
+  async upsertOneObject(
     className: string,
     schema: SchemaType,
     query: QueryType,
@@ -2293,7 +2293,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     });
   }
 
-  async find(className, schema, query, options) {
+  async find(className: string, schema: SchemaType, query: QueryType, options) {
     debug('find', className);
 
     const { skip, limit, sort, keys, caseInsensitive, explain } = options;
@@ -2341,25 +2341,29 @@ export class OracleStorageAdapter implements StorageAdapter {
         : `OFFSET ${offsetValue} ROWS`;
     }
 
-    const query = `SELECT ${columns} FROM "${className}" ${wherePattern} ${sortPattern} ${paginationPattern}`.trim();
+    const dataQuery = `SELECT ${columns} FROM "${className}" ${wherePattern} ${sortPattern} ${paginationPattern}`.trim();
 
     const connection = await this._client.getConnection();
 
     try {
       const result = await connection.execute(
-        explain ? this.createExplainableQuery(query) : query,
+        explain ? this.createExplainableQuery(dataQuery) : dataQuery,
         where.binds || {},
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
-      if (explain) return result.rows;
+      if (explain) {
+        return result.rows;
+      }
 
       return result.rows.map(obj =>
-        this.OracleObjectToParseObject(className, obj, schema)
+        this.oracleObjectToParseObject(className, obj, schema)
       );
 
     } catch (error) {
-      if (error.errorNum === 942) return [];
+      if (error.errorNum === 942) {
+        return [];
+      }
       throw error;
     } finally {
       await connection.close();
@@ -2367,7 +2371,7 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
   // Converts from a Oracle-format object to a REST-format object.
   // Does not strip out anything based on a lack of authentication.
-  OracleObjectToParseObject(className: string, object: any, schema: any) {
+  oracleObjectToParseObject(className: string, object: any, schema: any) {
     Object.keys(schema.fields).forEach(fieldName => {
       if (schema.fields[fieldName].type === 'Pointer' && object[fieldName]) {
         object[fieldName] = {
@@ -2620,7 +2624,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
 
       return results.map(object =>
-        this.OracleObjectToParseObject(className, object, schema)
+        this.oracleObjectToParseObject(className, object, schema)
       );
 
     } catch (error) {
@@ -2828,7 +2832,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
 
       const results = result.rows.map(object =>
-        this.OracleObjectToParseObject(className, object, schema)
+        this.oracleObjectToParseObject(className, object, schema)
       );
 
       results.forEach(result => {

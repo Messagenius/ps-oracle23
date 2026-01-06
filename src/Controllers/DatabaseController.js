@@ -16,6 +16,7 @@ import * as SchemaController from './SchemaController';
 import { StorageAdapter } from '../Adapters/Storage/StorageAdapter';
 import MongoStorageAdapter from '../Adapters/Storage/Mongo/MongoStorageAdapter';
 import PostgresStorageAdapter from '../Adapters/Storage/Postgres/PostgresStorageAdapter';
+import OracleStorageAdapter from '../Adapters/Storage/Oracle/OracleStorageAdapter';
 import SchemaCache from '../Adapters/Cache/SchemaCache';
 import type { LoadSchemaOptions } from './types';
 import type { ParseServerOptions } from '../Options';
@@ -1778,13 +1779,15 @@ class DatabaseController {
 
     const isMongoAdapter = this.adapter instanceof MongoStorageAdapter;
     const isPostgresAdapter = this.adapter instanceof PostgresStorageAdapter;
-    if (isMongoAdapter || isPostgresAdapter) {
+    const isOracleAdapter = this.adapter instanceof OracleStorageAdapter;
+
+    if (isMongoAdapter || isPostgresAdapter || isOracleAdapter) {
       let options = {};
       if (isMongoAdapter) {
         options = {
           ttl: 0,
         };
-      } else if (isPostgresAdapter) {
+      } else if (isPostgresAdapter || isOracleAdapter) {
         options = this.idempotencyOptions;
         options.setIdempotencyFunction = true;
       }

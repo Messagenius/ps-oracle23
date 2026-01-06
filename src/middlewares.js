@@ -7,6 +7,7 @@ import defaultLogger from './logger';
 import rest from './rest';
 import MongoStorageAdapter from './Adapters/Storage/Mongo/MongoStorageAdapter';
 import PostgresStorageAdapter from './Adapters/Storage/Postgres/PostgresStorageAdapter';
+import OracleStorageAdapter from './Adapters/Storage/Oracle/OracleStorageAdapter';
 import rateLimit from 'express-rate-limit';
 import { RateLimitOptions } from './Options/Definitions';
 import { pathToRegexp } from 'path-to-regexp';
@@ -632,7 +633,8 @@ export function promiseEnsureIdempotency(req) {
   if (
     !(
       req.config.database.adapter instanceof MongoStorageAdapter ||
-      req.config.database.adapter instanceof PostgresStorageAdapter
+      req.config.database.adapter instanceof PostgresStorageAdapter ||
+      req.config.database.adapter instanceof OracleStorageAdapter
     )
   ) {
     return Promise.resolve();
