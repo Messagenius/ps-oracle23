@@ -2566,76 +2566,86 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
   }
 
-  async distinct(className: string, schema: SchemaType, query: QueryType, fieldName: string) {
-    debug('distinct');
-    let field = fieldName;
-    let column = fieldName;
-    const isNested = fieldName.indexOf('.') >= 0;
-    if (isNested) {
-      field = transformDotFieldToComponents(fieldName).join('->');
-      column = fieldName.split('.')[0];
-    }
-    const isArrayField =
-      schema.fields && schema.fields[fieldName] && schema.fields[fieldName].type === 'Array';
-    const isPointerField =
-      schema.fields && schema.fields[fieldName] && schema.fields[fieldName].type === 'Pointer';
-    const values = [field, column, className];
-    const where = buildWhereClause({
-      schema,
-      query,
-      index: 4,
-      caseInsensitive: false,
-    });
-    values.push(...where.values);
+  async distinct(className, schema, query, fieldName) {
+    debug('distinct', className, fieldName);
 
-    const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
-    const transformer = isArrayField ? 'jsonb_array_elements' : 'ON';
-    let qs = `SELECT DISTINCT ${transformer}($1:name) $2:name FROM $3:name ${wherePattern}`;
-    if (isNested) {
-      qs = `SELECT DISTINCT ${transformer}($1:raw) $2:raw FROM $3:name ${wherePattern}`;
-    }
-    return this._client
-      .any(qs, values)
-      .catch(error => {
-        if (error.code === OracleMissingColumnError) {
-          return [];
-        }
-        throw error;
-      })
-      .then(results => {
-        if (!isNested) {
-          results = results.filter(object => object[field] !== null);
-          return results.map(object => {
-            if (!isPointerField) {
-              return object[field];
-            }
-            return {
-              __type: 'Pointer',
-              className: schema.fields[fieldName].targetClass,
-              objectId: object[field],
-            };
-          });
-        }
-        const child = fieldName.split('.')[1];
-        return results.map(object => object[column][child]);
-      })
-      .then(results =>
-        results.map(object => this.OracleObjectToParseObject(className, object, schema))
+    const isNested = fieldName.indexOf('.') >= 0;
+    const isArrayField = schema.fields?.[fieldName]?.type === 'Array';
+    const isPointerField = schema.fields?.[fieldName]?.type === 'Pointer';
+
+    const where = buildWhereClause({ schema, query, caseInsensitive: false });
+    const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
+
+    const connection = await this._client.getConnection();
+
+    try {
+      let sql;
+
+      if (isNested) {
+        const [column, child] = fieldName.split('.');
+        sql = `
+        SELECT DISTINCT JSON_VALUE("${column}", '$.${child}') as value
+        FROM "${className}"
+        ${wherePattern}
+      `;
+      } else if (isArrayField) {
+        sql = `
+        SELECT DISTINCT jt.value
+        FROM "${className}" t,
+        JSON_TABLE(t."${fieldName}", '$[*]' 
+          COLUMNS (value VARCHAR2(4000) PATH '$')
+        ) jt
+        ${wherePattern}
+      `;
+      } else {
+        sql = `SELECT DISTINCT "${fieldName}" as value FROM "${className}" ${wherePattern}`;
+      }
+
+      const result = await connection.execute(
+        sql,
+        where.binds || {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
+
+      let results = result.rows
+        .filter(row => row.VALUE !== null)
+        .map(row => row.VALUE);
+
+      if (isPointerField && !isNested) {
+        results = results.map(objectId => ({
+          __type: 'Pointer',
+          className: schema.fields[fieldName].targetClass,
+          objectId: objectId,
+        }));
+      }
+
+      return results.map(object =>
+        this.OracleObjectToParseObject(className, object, schema)
+      );
+
+    } catch (error) {
+      if (error.errorNum === 904) return [];
+      throw error;
+    } finally {
+      await connection.close();
+    }
   }
 
   async aggregate(
     className: string,
     schema: any,
     pipeline: any,
-    readPreference: ?string,
-    hint: ?mixed,
+    readPreference?: string,
+    hint?: any,
     explain?: boolean
   ) {
-    debug('aggregate');
-    const values = [className];
-    let index: number = 2;
-    let columns: string[] = [];
+    debug('aggregate', className);
+
+    const binds = {};
+    let bindIndex = 0;
+    const getBindName = () => `val${bindIndex++}`;
+
+    let columns = [];
     let countField = null;
     let groupValues = null;
     let wherePattern = '';
@@ -2643,88 +2653,84 @@ export class OracleStorageAdapter implements StorageAdapter {
     let skipPattern = '';
     let sortPattern = '';
     let groupPattern = '';
-    for (let i = 0; i < pipeline.length; i += 1) {
+
+    for (let i = 0; i < pipeline.length; i++) {
       const stage = pipeline[i];
+
       if (stage.$group) {
         for (const field in stage.$group) {
           const value = stage.$group[field];
-          if (value === null || value === undefined) {
-            continue;
-          }
+          if (value === null || value === undefined) continue;
+
           if (field === '_id' && typeof value === 'string' && value !== '') {
-            columns.push(`$${index}:name AS "objectId"`);
-            groupPattern = `GROUP BY $${index}:name`;
-            values.push(transformAggregateField(value));
-            index += 1;
+            const fieldName = transformAggregateField(value);
+            columns.push(`"${fieldName}" AS "objectId"`);
+            groupPattern = `GROUP BY "${fieldName}"`;
             continue;
           }
+
           if (field === '_id' && typeof value === 'object' && Object.keys(value).length !== 0) {
             groupValues = value;
             const groupByFields = [];
+
             for (const alias in value) {
               if (typeof value[alias] === 'string' && value[alias]) {
                 const source = transformAggregateField(value[alias]);
                 if (!groupByFields.includes(`"${source}"`)) {
                   groupByFields.push(`"${source}"`);
                 }
-                values.push(source, alias);
-                columns.push(`$${index}:name AS $${index + 1}:name`);
-                index += 2;
+                columns.push(`"${source}" AS "${alias}"`);
               } else {
                 const operation = Object.keys(value[alias])[0];
                 const source = transformAggregateField(value[alias][operation]);
+
                 if (mongoAggregateToOracle[operation]) {
                   if (!groupByFields.includes(`"${source}"`)) {
                     groupByFields.push(`"${source}"`);
                   }
                   columns.push(
-                    `EXTRACT(${
-                      mongoAggregateToOracle[operation]
-                    } FROM $${index}:name AT TIME ZONE 'UTC')::integer AS $${index + 1}:name`
+                    `CAST(EXTRACT(${mongoAggregateToOracle[operation]} FROM "${source}") AS NUMBER) AS "${alias}"`
                   );
-                  values.push(source, alias);
-                  index += 2;
                 }
               }
             }
-            groupPattern = `GROUP BY $${index}:raw`;
-            values.push(groupByFields.join());
-            index += 1;
+
+            groupPattern = `GROUP BY ${groupByFields.join(', ')}`;
             continue;
           }
+
           if (typeof value === 'object') {
+            // $sum
             if (value.$sum) {
               if (typeof value.$sum === 'string') {
-                columns.push(`SUM($${index}:name) AS $${index + 1}:name`);
-                values.push(transformAggregateField(value.$sum), field);
-                index += 2;
+                const fieldName = transformAggregateField(value.$sum);
+                columns.push(`SUM("${fieldName}") AS "${field}"`);
               } else {
                 countField = field;
-                columns.push(`COUNT(*) AS $${index}:name`);
-                values.push(field);
-                index += 1;
+                columns.push(`COUNT(*) AS "${field}"`);
               }
             }
+            // $max
             if (value.$max) {
-              columns.push(`MAX($${index}:name) AS $${index + 1}:name`);
-              values.push(transformAggregateField(value.$max), field);
-              index += 2;
+              const fieldName = transformAggregateField(value.$max);
+              columns.push(`MAX("${fieldName}") AS "${field}"`);
             }
+            // $min
             if (value.$min) {
-              columns.push(`MIN($${index}:name) AS $${index + 1}:name`);
-              values.push(transformAggregateField(value.$min), field);
-              index += 2;
+              const fieldName = transformAggregateField(value.$min);
+              columns.push(`MIN("${fieldName}") AS "${field}"`);
             }
+            // $avg
             if (value.$avg) {
-              columns.push(`AVG($${index}:name) AS $${index + 1}:name`);
-              values.push(transformAggregateField(value.$avg), field);
-              index += 2;
+              const fieldName = transformAggregateField(value.$avg);
+              columns.push(`AVG("${fieldName}") AS "${field}"`);
             }
           }
         }
       } else {
         columns.push('*');
       }
+
       if (stage.$project) {
         if (columns.includes('*')) {
           columns = [];
@@ -2732,17 +2738,14 @@ export class OracleStorageAdapter implements StorageAdapter {
         for (const field in stage.$project) {
           const value = stage.$project[field];
           if (value === 1 || value === true) {
-            columns.push(`$${index}:name`);
-            values.push(field);
-            index += 1;
+            columns.push(`"${field}"`);
           }
         }
       }
+
       if (stage.$match) {
         const patterns = [];
-        const orOrAnd = Object.prototype.hasOwnProperty.call(stage.$match, '$or')
-          ? ' OR '
-          : ' AND ';
+        const orOrAnd = stage.$match.$or ? ' OR ' : ' AND ';
 
         if (stage.$match.$or) {
           const collapse = {};
@@ -2753,78 +2756,86 @@ export class OracleStorageAdapter implements StorageAdapter {
           });
           stage.$match = collapse;
         }
+
         for (let field in stage.$match) {
           const value = stage.$match[field];
           if (field === '_id') {
             field = 'objectId';
           }
+
           const matchPatterns = [];
+
           Object.keys(ParseToOracleComparator).forEach(cmp => {
-            if (value[cmp]) {
-              const pgComparator = ParseToOracleComparator[cmp];
-              matchPatterns.push(`$${index}:name ${pgComparator} $${index + 1}`);
-              values.push(field, toOracleValue(value[cmp]));
-              index += 2;
+            if (value[cmp] !== undefined) {
+              const oracleComparator = ParseToOracleComparator[cmp];
+              const bindName = getBindName();
+              binds[bindName] = toOracleValue(value[cmp]);
+              matchPatterns.push(`"${field}" ${oracleComparator} :${bindName}`);
             }
           });
+
           if (matchPatterns.length > 0) {
             patterns.push(`(${matchPatterns.join(' AND ')})`);
-          }
-          if (schema.fields[field] && schema.fields[field].type && matchPatterns.length === 0) {
-            patterns.push(`$${index}:name = $${index + 1}`);
-            values.push(field, value);
-            index += 2;
+          } else if (schema.fields[field]?.type && matchPatterns.length === 0) {
+            const bindName = getBindName();
+            binds[bindName] = value;
+            patterns.push(`"${field}" = :${bindName}`);
           }
         }
+
         wherePattern = patterns.length > 0 ? `WHERE ${patterns.join(` ${orOrAnd} `)}` : '';
       }
+
+      // $limit
       if (stage.$limit) {
-        limitPattern = `LIMIT $${index}`;
-        values.push(stage.$limit);
-        index += 1;
+        limitPattern = `FETCH FIRST ${stage.$limit} ROWS ONLY`;
       }
+
+      // $skip
       if (stage.$skip) {
-        skipPattern = `OFFSET $${index}`;
-        values.push(stage.$skip);
-        index += 1;
+        skipPattern = `OFFSET ${stage.$skip} ROWS`;
       }
+
       if (stage.$sort) {
         const sort = stage.$sort;
         const keys = Object.keys(sort);
         const sorting = keys
           .map(key => {
             const transformer = sort[key] === 1 ? 'ASC' : 'DESC';
-            const order = `$${index}:name ${transformer}`;
-            index += 1;
-            return order;
+            return `"${key}" ${transformer}`;
           })
-          .join();
-        values.push(...keys);
-        sortPattern = sort !== undefined && sorting.length > 0 ? `ORDER BY ${sorting}` : '';
+          .join(', ');
+        sortPattern = sorting.length > 0 ? `ORDER BY ${sorting}` : '';
       }
     }
 
     if (groupPattern) {
-      columns.forEach((e, i, a) => {
-        if (e && e.trim() === '*') {
-          a[i] = '';
-        }
-      });
+      columns = columns.filter(col => col.trim() !== '*');
     }
 
-    const originalQuery = `SELECT ${columns
-      .filter(Boolean)
-      .join()} FROM $1:name ${wherePattern} ${skipPattern} ${groupPattern} ${sortPattern} ${limitPattern}`;
-    const qs = explain ? this.createExplainableQuery(originalQuery) : originalQuery;
-    return this._client.any(qs, values).then(a => {
+    const columnsList = columns.filter(Boolean).join(', ') || '*';
+    const sql = `SELECT ${columnsList} FROM "${className}" ${wherePattern} ${groupPattern} ${sortPattern} ${skipPattern} ${limitPattern}`.trim();
+
+    try {
+      const result = await this._client.execute(
+        explain ? this.createExplainableQuery(sql) : sql,
+        binds,
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
       if (explain) {
-        return a;
+        return result.rows;
       }
-      const results = a.map(object => this.OracleObjectToParseObject(className, object, schema));
+
+      const results = result.rows.map(object =>
+        this.OracleObjectToParseObject(className, object, schema)
+      );
+
       results.forEach(result => {
         if (!Object.prototype.hasOwnProperty.call(result, 'objectId')) {
           result.objectId = null;
         }
+
         if (groupValues) {
           result.objectId = {};
           for (const key in groupValues) {
@@ -2832,13 +2843,20 @@ export class OracleStorageAdapter implements StorageAdapter {
             delete result[key];
           }
         }
+
         if (countField) {
           result[countField] = parseInt(result[countField], 10);
         }
       });
+
       return results;
-    });
+
+    } catch (error) {
+      debug('Aggregate error:', error);
+      throw error;
+    }
   }
+
 
   async performInitialization({ VolatileClassesSchemas }: any) {
     // TODO: This method needs to be rewritten to make proper use of connections (@vitaly-t)
@@ -2880,44 +2898,156 @@ export class OracleStorageAdapter implements StorageAdapter {
       });
   }
 
-  async createIndexes(className: string, indexes: any, conn: ?any): Promise<void> {
-    return (conn || this._client).tx(t =>
-      t.batch(
-        indexes.map(i => {
-          return t.none('CREATE INDEX IF NOT EXISTS $1:name ON $2:name ($3:name)', [
-            i.name,
-            className,
-            i.key,
-          ]);
-        })
-      )
-    );
+  async createIndexes(className: string, indexes: any, conn?: any): Promise<void> {
+    debug('createIndexes', className, indexes);
+
+    const connection = conn || await this._client.getConnection();
+    const shouldCloseConnection = !conn;
+
+    try {
+      for (const index of indexes) {
+        const indexName = index.name || `${className}_${index.key}_idx`;
+        const columnName = index.key;
+
+        const createIndexSql = `CREATE INDEX "${indexName}" ON "${className}" ("${columnName}")`;
+
+        try {
+          await connection.execute(createIndexSql);
+          debug(`Created index: ${indexName}`);
+        } catch (error) {
+          // ORA-00955: name is already used by an existing object
+          if (error.errorNum === 955) {
+            debug(`Index ${indexName} already exists, skipping`);
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+      throw error;
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
   async createIndexesIfNeeded(
     className: string,
     fieldName: string,
     type: any,
-    conn: ?any
+    conn?: any
   ): Promise<void> {
-    await (conn || this._client).none('CREATE INDEX IF NOT EXISTS $1:name ON $2:name ($3:name)', [
-      fieldName,
-      className,
-      type,
-    ]);
+    debug('createIndexesIfNeeded', className, fieldName);
+
+    const connection = conn || await this._client.getConnection();
+    const shouldCloseConnection = !conn;
+
+    try {
+      const indexName = `${className}_${fieldName}_idx`;
+      const createIndexSql = `CREATE INDEX "${indexName}" ON "${className}" ("${fieldName}")`;
+
+      try {
+        await connection.execute(createIndexSql);
+        debug(`Created index: ${indexName}`);
+      } catch (error) {
+        // ORA-00955: name is already used by an existing object
+        if (error.errorNum !== 955) {
+          throw error;
+        }
+        debug(`Index ${indexName} already exists`);
+      }
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+      throw error;
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
-  async dropIndexes(className: string, indexes: any, conn: any): Promise<void> {
-    const queries = indexes.map(i => ({
-      query: 'DROP INDEX $1:name',
-      values: i,
-    }));
-    await (conn || this._client).tx(t => t.none(this._pgp.helpers.concat(queries)));
+  async dropIndexes(className: string, indexes: any, conn?: any): Promise<void> {
+    debug('dropIndexes', className, indexes);
+
+    const connection = conn || await this._client.getConnection();
+    const shouldCloseConnection = !conn;
+
+    try {
+      for (const indexName of indexes) {
+        const dropIndexSql = `DROP INDEX "${indexName}"`;
+
+        try {
+          await connection.execute(dropIndexSql);
+          debug(`Dropped index: ${indexName}`);
+        } catch (error) {
+          // ORA-01418: specified index does not exist
+          if (error.errorNum === 1418) {
+            debug(`Index ${indexName} does not exist, skipping`);
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+      throw error;
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
   async getIndexes(className: string) {
-    const qs = 'SELECT * FROM pg_indexes WHERE tablename = ${className}';
-    return this._client.any(qs, { className });
+    debug('getIndexes', className);
+
+    try {
+      const sql = `
+      SELECT 
+        index_name as "indexname",
+        table_name as "tablename",
+        uniqueness as "unique",
+        column_name as "columnname"
+      FROM user_ind_columns
+      WHERE table_name = :tableName
+      ORDER BY index_name, column_position
+    `;
+
+      const result = await this._client.execute(
+        sql,
+        { tableName: className.toUpperCase() },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      return result.rows;
+
+    } catch (error) {
+      debug('Error getting indexes:', error);
+      throw error;
+    }
   }
 
   async updateSchemaWithIndexes(): Promise<void> {
@@ -2926,94 +3056,243 @@ export class OracleStorageAdapter implements StorageAdapter {
 
   // Used for testing purposes
   async updateEstimatedCount(className: string) {
-    return this._client.none('ANALYZE $1:name', [className]);
+    debug('updateEstimatedCount', className);
+
+    try {
+      const analyzeSql = `
+      BEGIN
+        DBMS_STATS.GATHER_TABLE_STATS(
+          ownname => USER,
+          tabname => '${className.toUpperCase()}',
+          estimate_percent => DBMS_STATS.AUTO_SAMPLE_SIZE,
+          method_opt => 'FOR ALL COLUMNS SIZE AUTO'
+        );
+      END;
+    `;
+
+      await this._client.execute(analyzeSql);
+
+      debug(`Updated statistics for ${className}`);
+
+    } catch (error) {
+      debug('Error updating estimated count:', error);
+      throw error;
+    }
   }
 
   async createTransactionalSession(): Promise<any> {
-    return new Promise(resolve => {
-      const transactionalSession = {};
-      transactionalSession.result = this._client.tx(t => {
-        transactionalSession.t = t;
-        transactionalSession.promise = new Promise(resolve => {
-          transactionalSession.resolve = resolve;
-        });
-        transactionalSession.batch = [];
-        resolve(transactionalSession);
-        return transactionalSession.promise;
-      });
-    });
+    debug('createTransactionalSession');
+
+    const connection = await this._client.getConnection();
+
+    const transactionalSession = {
+      connection: connection,
+      operations: [],
+      committed: false,
+      aborted: false
+    };
+
+    return transactionalSession;
   }
 
-  commitTransactionalSession(transactionalSession: any): Promise<void> {
-    transactionalSession.resolve(transactionalSession.t.batch(transactionalSession.batch));
-    return transactionalSession.result;
+  async commitTransactionalSession(transactionalSession: any): Promise<void> {
+    debug('commitTransactionalSession');
+
+    if (transactionalSession.aborted) {
+      throw new Error('Cannot commit an aborted transaction');
+    }
+
+    if (transactionalSession.committed) {
+      debug('Transaction already committed');
+      return;
+    }
+
+    try {
+      for (const operation of transactionalSession.operations) {
+        await operation(transactionalSession.connection);
+      }
+
+      await transactionalSession.connection.commit();
+      transactionalSession.committed = true;
+
+      debug('Transaction committed successfully');
+
+    } catch (error) {
+      debug('Error committing transaction:', error);
+      await transactionalSession.connection.rollback();
+      throw error;
+    } finally {
+      await transactionalSession.connection.close();
+    }
   }
 
-  abortTransactionalSession(transactionalSession: any): Promise<void> {
-    const result = transactionalSession.result.catch();
-    transactionalSession.batch.push(Promise.reject());
-    transactionalSession.resolve(transactionalSession.t.batch(transactionalSession.batch));
-    return result;
+  async abortTransactionalSession(transactionalSession: any): Promise<void> {
+    debug('abortTransactionalSession');
+
+    if (transactionalSession.committed) {
+      throw new Error('Cannot abort a committed transaction');
+    }
+
+    if (transactionalSession.aborted) {
+      debug('Transaction already aborted');
+      return;
+    }
+
+    try {
+      await transactionalSession.connection.rollback();
+      transactionalSession.aborted = true;
+
+      debug('Transaction aborted successfully');
+
+    } catch (error) {
+      debug('Error aborting transaction:', error);
+      throw error;
+    } finally {
+      await transactionalSession.connection.close();
+    }
   }
 
   async ensureIndex(
     className: string,
     schema: SchemaType,
     fieldNames: string[],
-    indexName: ?string,
+    indexName?: string,
     caseInsensitive: boolean = false,
-    options?: Object = {}
+    options: any = {}
   ): Promise<any> {
-    const conn = options.conn !== undefined ? options.conn : this._client;
-    const defaultIndexName = `parse_default_${fieldNames.sort().join('_')}`;
-    const indexNameOptions: Object =
-      indexName != null ? { name: indexName } : { name: defaultIndexName };
-    const constraintPatterns = caseInsensitive
-      ? fieldNames.map((fieldName, index) => `lower($${index + 3}:name) varchar_pattern_ops`)
-      : fieldNames.map((fieldName, index) => `$${index + 3}:name`);
-    const qs = `CREATE INDEX IF NOT EXISTS $1:name ON $2:name (${constraintPatterns.join()})`;
-    const setIdempotencyFunction =
-      options.setIdempotencyFunction !== undefined ? options.setIdempotencyFunction : false;
-    if (setIdempotencyFunction) {
-      await this.ensureIdempotencyFunctionExists(options);
-    }
-    await conn.none(qs, [indexNameOptions.name, className, ...fieldNames]).catch(error => {
-      if (
-        error.code === OracleDuplicateRelationError &&
-        error.message.includes(indexNameOptions.name)
-      ) {
-        // Index already exists. Ignore error.
-      } else if (
-        error.code === OracleUniqueIndexViolationError &&
-        error.message.includes(indexNameOptions.name)
-      ) {
-        // Cast the error into the proper parse error
-        throw new Parse.Error(
-          Parse.Error.DUPLICATE_VALUE,
-          'A duplicate value for a field with unique values was provided'
-        );
+    debug('ensureIndex', className, fieldNames);
+
+    const connection = options.conn || await this._client.getConnection();
+    const shouldCloseConnection = !options.conn;
+
+    try {
+      const defaultIndexName = `parse_default_${fieldNames.sort().join('_')}`;
+      const finalIndexName = indexName || defaultIndexName;
+
+      let columnsList;
+      if (caseInsensitive) {
+        columnsList = fieldNames.map(field => `LOWER("${field}")`).join(', ');
       } else {
-        throw error;
+        columnsList = fieldNames.map(field => `"${field}"`).join(', ');
       }
-    });
+
+      const createIndexSql = `CREATE INDEX "${finalIndexName}" ON "${className}" (${columnsList})`;
+
+      if (options.setIdempotencyFunction) {
+        await this.ensureIdempotencyFunctionExists(options);
+      }
+
+      try {
+        await connection.execute(createIndexSql);
+        debug(`Created index: ${finalIndexName}`);
+      } catch (error) {
+        // ORA-00955: name is already used by an existing object
+        if (error.errorNum === 955 && error.message.includes(finalIndexName)) {
+          debug(`Index ${finalIndexName} already exists, ignoring`);
+        }
+        // ORA-00001: unique constraint violated
+        else if (error.errorNum === 1 && error.message.includes(finalIndexName)) {
+          throw new Parse.Error(
+            Parse.Error.DUPLICATE_VALUE,
+            'A duplicate value for a field with unique values was provided'
+          );
+        } else {
+          throw error;
+        }
+      }
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
+      throw error;
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
-  async deleteIdempotencyFunction(options?: Object = {}): Promise<any> {
-    const conn = options.conn !== undefined ? options.conn : this._client;
-    const qs = 'DROP FUNCTION IF EXISTS idempotency_delete_expired_records()';
-    return conn.none(qs).catch(error => {
+  async deleteIdempotencyFunction(options: any = {}): Promise<any> {
+    debug('deleteIdempotencyFunction');
+
+    const connection = options.conn || await this._client.getConnection();
+    const shouldCloseConnection = !options.conn;
+
+    try {
+      const dropSql = `
+      BEGIN
+        EXECUTE IMMEDIATE 'DROP PROCEDURE idempotency_delete_expired_records';
+      EXCEPTION
+        WHEN OTHERS THEN
+          IF SQLCODE != -4043 THEN -- ORA-04043: object does not exist
+            RAISE;
+          END IF;
+      END;
+    `;
+
+      await connection.execute(dropSql);
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+      debug('Idempotency function deleted');
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
       throw error;
-    });
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 
-  async ensureIdempotencyFunctionExists(options?: Object = {}): Promise<any> {
-    const conn = options.conn !== undefined ? options.conn : this._client;
-    const ttlOptions = options.ttl !== undefined ? `${options.ttl} seconds` : '60 seconds';
-    const qs =
-      'CREATE OR REPLACE FUNCTION idempotency_delete_expired_records() RETURNS void LANGUAGE plpgsql AS $$ BEGIN DELETE FROM "_Idempotency" WHERE expire < NOW() - INTERVAL $1; END; $$;';
-    return conn.none(qs, [ttlOptions]).catch(error => {
+  async ensureIdempotencyFunctionExists(options: any = {}): Promise<any> {
+    debug('ensureIdempotencyFunctionExists');
+
+    const connection = options.conn || await this._client.getConnection();
+    const shouldCloseConnection = !options.conn;
+
+    try {
+      const ttlSeconds = options.ttl || 60;
+
+      const createProcedureSql = `
+      CREATE OR REPLACE PROCEDURE idempotency_delete_expired_records
+      IS
+      BEGIN
+        DELETE FROM "_Idempotency"
+        WHERE expire < SYSTIMESTAMP - INTERVAL '${ttlSeconds}' SECOND;
+        
+        COMMIT;
+      END;
+    `;
+
+      await connection.execute(createProcedureSql);
+
+      if (shouldCloseConnection) {
+        await connection.commit();
+      }
+
+      debug(`Idempotency function created with TTL: ${ttlSeconds} seconds`);
+
+    } catch (error) {
+      if (shouldCloseConnection) {
+        await connection.rollback();
+      }
       throw error;
-    });
+    } finally {
+      if (shouldCloseConnection && connection) {
+        await connection.close();
+      }
+    }
   }
 }
 
