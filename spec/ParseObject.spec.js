@@ -234,6 +234,9 @@ describe('Parse.Object testing', () => {
         on_db('postgres', () => {
           equal(obj.get('foo'), null);
         });
+        on_db('oracle', () => {
+          equal(obj.get('foo'), null);
+        });
         done();
       },
       function () {
@@ -562,6 +565,9 @@ describe('Parse.Object testing', () => {
           });
           on_db('postgres', () => {
             expect(error.message).toEqual('Postgres does not support AddUnique operator.');
+          });
+          on_db('oracle', () => {
+            expect(error.message).toBeDefined();
           });
           done();
         }

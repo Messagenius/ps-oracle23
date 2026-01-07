@@ -1094,6 +1094,16 @@ describe('SchemaController', () => {
               expect(exist).toEqual(false);
             }
           );
+          on_db(
+            'oracle',
+            () => {
+              // We create the table when creating the column
+              expect(exist).toEqual(true);
+            },
+            () => {
+              expect(exist).toEqual(false);
+            }
+          );
         })
         .then(() => schema.deleteField('relationField', 'NewClass', config.database))
         .then(() => schema.reloadData())

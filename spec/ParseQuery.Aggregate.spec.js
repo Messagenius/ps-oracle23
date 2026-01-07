@@ -296,7 +296,7 @@ describe('Parse.Query Aggregate testing', () => {
       .catch(done.fail);
   });
 
-  it_id('c7695018-03de-49e4-8a72-d4d956f70deb')(it_exclude_dbs(['postgres']))('group and multiply transform', done => {
+  it_id('c7695018-03de-49e4-8a72-d4d956f70deb')(it_exclude_dbs(['postgres', 'oracle']))('group and multiply transform', done => {
     const obj1 = new TestObject({ name: 'item a', quantity: 2, price: 10 });
     const obj2 = new TestObject({ name: 'item b', quantity: 5, price: 5 });
     const pipeline = [
@@ -319,89 +319,99 @@ describe('Parse.Query Aggregate testing', () => {
       });
   });
 
-  it_id('2d278175-7594-4b29-bef4-04c778b7a42f')(it_exclude_dbs(['postgres']))('project and multiply transform', done => {
-    const obj1 = new TestObject({ name: 'item a', quantity: 2, price: 10 });
-    const obj2 = new TestObject({ name: 'item b', quantity: 5, price: 5 });
-    const pipeline = [
-      {
-        $match: { quantity: { $exists: true } },
-      },
-      {
-        $project: {
-          name: 1,
-          total: { $multiply: ['$quantity', '$price'] },
+  it_id('2d278175-7594-4b29-bef4-04c778b7a42f')(it_exclude_dbs(['postgres', 'oracle']))(
+    'project and multiply transform',
+    done => {
+      const obj1 = new TestObject({ name: 'item a', quantity: 2, price: 10 });
+      const obj2 = new TestObject({ name: 'item b', quantity: 5, price: 5 });
+      const pipeline = [
+        {
+          $match: { quantity: { $exists: true } },
         },
-      },
-    ];
-    Parse.Object.saveAll([obj1, obj2])
-      .then(() => {
-        const query = new Parse.Query(TestObject);
-        return query.aggregate(pipeline);
-      })
-      .then(results => {
-        expect(results.length).toEqual(2);
-        if (results[0].name === 'item a') {
+        {
+          $project: {
+            name: 1,
+            total: { $multiply: ['$quantity', '$price'] },
+          },
+        },
+      ];
+      Parse.Object.saveAll([obj1, obj2])
+        .then(() => {
+          const query = new Parse.Query(TestObject);
+          return query.aggregate(pipeline);
+        })
+        .then(results => {
+          expect(results.length).toEqual(2);
+          if (results[0].name === 'item a') {
+            expect(results[0].total).toEqual(20);
+            expect(results[1].total).toEqual(25);
+          } else {
+            expect(results[0].total).toEqual(25);
+            expect(results[1].total).toEqual(20);
+          }
+          done();
+        });
+    }
+  );
+
+  it_id('9c9d9318-3a9e-4c2a-8a09-d3aa52c7505b')(it_exclude_dbs(['postgres', 'oracle']))(
+    'project without objectId transform',
+    done => {
+      const obj1 = new TestObject({ name: 'item a', quantity: 2, price: 10 });
+      const obj2 = new TestObject({ name: 'item b', quantity: 5, price: 5 });
+      const pipeline = [
+        {
+          $match: { quantity: { $exists: true } },
+        },
+        {
+          $project: {
+            _id: 0,
+            total: { $multiply: ['$quantity', '$price'] },
+          },
+        },
+        {
+          $sort: { total: 1 },
+        },
+      ];
+      Parse.Object.saveAll([obj1, obj2])
+        .then(() => {
+          const query = new Parse.Query(TestObject);
+          return query.aggregate(pipeline);
+        })
+        .then(results => {
+          expect(results.length).toEqual(2);
           expect(results[0].total).toEqual(20);
+          expect(results[0].objectId).toEqual(undefined);
           expect(results[1].total).toEqual(25);
-        } else {
-          expect(results[0].total).toEqual(25);
-          expect(results[1].total).toEqual(20);
+          expect(results[1].objectId).toEqual(undefined);
+          done();
+        });
+    }
+  );
+
+  it_id('f92c82ac-1993-4758-b718-45689dfc4154')(it_exclude_dbs(['postgres', 'oracle']))(
+    'project updatedAt only transform',
+    done => {
+      const pipeline = [
+        {
+          $project: { _id: 0, updatedAt: 1 },
+        },
+      ];
+      const query = new Parse.Query(TestObject);
+      query.aggregate(pipeline).then(results => {
+        expect(results.length).toEqual(4);
+        for (let i = 0; i < results.length; i++) {
+          const item = results[i];
+          expect(Object.prototype.hasOwnProperty.call(item, 'updatedAt')).toEqual(true);
+          expect(Object.prototype.hasOwnProperty.call(item, 'objectId')).toEqual(false);
         }
         done();
       });
-  });
+    }
+  );
 
-  it_id('9c9d9318-3a9e-4c2a-8a09-d3aa52c7505b')(it_exclude_dbs(['postgres']))('project without objectId transform', done => {
-    const obj1 = new TestObject({ name: 'item a', quantity: 2, price: 10 });
-    const obj2 = new TestObject({ name: 'item b', quantity: 5, price: 5 });
-    const pipeline = [
-      {
-        $match: { quantity: { $exists: true } },
-      },
-      {
-        $project: {
-          _id: 0,
-          total: { $multiply: ['$quantity', '$price'] },
-        },
-      },
-      {
-        $sort: { total: 1 },
-      },
-    ];
-    Parse.Object.saveAll([obj1, obj2])
-      .then(() => {
-        const query = new Parse.Query(TestObject);
-        return query.aggregate(pipeline);
-      })
-      .then(results => {
-        expect(results.length).toEqual(2);
-        expect(results[0].total).toEqual(20);
-        expect(results[0].objectId).toEqual(undefined);
-        expect(results[1].total).toEqual(25);
-        expect(results[1].objectId).toEqual(undefined);
-        done();
-      });
-  });
-
-  it_id('f92c82ac-1993-4758-b718-45689dfc4154')(it_exclude_dbs(['postgres']))('project updatedAt only transform', done => {
-    const pipeline = [
-      {
-        $project: { _id: 0, updatedAt: 1 },
-      },
-    ];
-    const query = new Parse.Query(TestObject);
-    query.aggregate(pipeline).then(results => {
-      expect(results.length).toEqual(4);
-      for (let i = 0; i < results.length; i++) {
-        const item = results[i];
-        expect(Object.prototype.hasOwnProperty.call(item, 'updatedAt')).toEqual(true);
-        expect(Object.prototype.hasOwnProperty.call(item, 'objectId')).toEqual(false);
-      }
-      done();
-    });
-  });
-
-  it_id('99566b1d-778d-4444-9deb-c398108e659d')(it_exclude_dbs(['postgres']))('can group by any date field (it does not work if you have dirty data)',
+  it_id('99566b1d-778d-4444-9deb-c398108e659d')(it_exclude_dbs(['postgres', 'oracle']))(
+    'can group by any date field (it does not work if you have dirty data)',
     done => {
       // rows in your collection with non date data in the field that is supposed to be a date
       const obj1 = new TestObject({ dateField2019: new Date(1990, 11, 1) });
@@ -817,14 +827,17 @@ describe('Parse.Query Aggregate testing', () => {
       });
   });
 
-  it_id('3a1e2cdc-52c7-4060-bc90-b06d557d85ce')(it_exclude_dbs(['postgres']))('match exists query', done => {
-    const pipeline = [{ $match: { score: { $exists: true } } }];
-    const query = new Parse.Query(TestObject);
-    query.aggregate(pipeline).then(results => {
-      expect(results.length).toEqual(4);
-      done();
-    });
-  });
+  it_id('3a1e2cdc-52c7-4060-bc90-b06d557d85ce')(it_exclude_dbs(['postgres', 'oracle']))(
+    'match exists query',
+    done => {
+      const pipeline = [{ $match: { score: { $exists: true } } }];
+      const query = new Parse.Query(TestObject);
+      query.aggregate(pipeline).then(results => {
+        expect(results.length).toEqual(4);
+        done();
+      });
+    }
+  );
 
   it_id('0adea3f4-73f7-4b48-a7dd-c764ceb947ec')(it)('match date query - createdAt', done => {
     const obj1 = new TestObject();
@@ -882,78 +895,84 @@ describe('Parse.Query Aggregate testing', () => {
       });
   });
 
-  it_id('802ffc99-861b-4b72-90a6-0c666a2e3fd8')(it_exclude_dbs(['postgres']))('match pointer with operator query', done => {
-    const pointer = new PointerObject();
+  it_id('802ffc99-861b-4b72-90a6-0c666a2e3fd8')(it_exclude_dbs(['postgres', 'oracle']))(
+    'match pointer with operator query',
+    done => {
+      const pointer = new PointerObject();
 
-    const obj1 = new TestObject({ pointer });
-    const obj2 = new TestObject({ pointer });
-    const obj3 = new TestObject();
+      const obj1 = new TestObject({ pointer });
+      const obj2 = new TestObject({ pointer });
+      const obj3 = new TestObject();
 
-    Parse.Object.saveAll([pointer, obj1, obj2, obj3])
-      .then(() => {
-        const pipeline = [{ $match: { pointer: { $exists: true } } }];
-        const query = new Parse.Query(TestObject);
-        return query.aggregate(pipeline);
-      })
-      .then(results => {
-        expect(results.length).toEqual(2);
-        expect(results[0].pointer.objectId).toEqual(pointer.id);
-        expect(results[1].pointer.objectId).toEqual(pointer.id);
-        expect(results.some(result => result.objectId === obj1.id)).toEqual(true);
-        expect(results.some(result => result.objectId === obj2.id)).toEqual(true);
-        done();
-      });
-  });
+      Parse.Object.saveAll([pointer, obj1, obj2, obj3])
+        .then(() => {
+          const pipeline = [{ $match: { pointer: { $exists: true } } }];
+          const query = new Parse.Query(TestObject);
+          return query.aggregate(pipeline);
+        })
+        .then(results => {
+          expect(results.length).toEqual(2);
+          expect(results[0].pointer.objectId).toEqual(pointer.id);
+          expect(results[1].pointer.objectId).toEqual(pointer.id);
+          expect(results.some(result => result.objectId === obj1.id)).toEqual(true);
+          expect(results.some(result => result.objectId === obj2.id)).toEqual(true);
+          done();
+        });
+    }
+  );
 
-  it_id('28090280-7c3e-47f8-8bf6-bebf8566a36c')(it_exclude_dbs(['postgres']))('match null values', async () => {
-    const obj1 = new Parse.Object('MyCollection');
-    obj1.set('language', 'en');
-    obj1.set('otherField', 1);
-    const obj2 = new Parse.Object('MyCollection');
-    obj2.set('language', 'en');
-    obj2.set('otherField', 2);
-    const obj3 = new Parse.Object('MyCollection');
-    obj3.set('language', null);
-    obj3.set('otherField', 3);
-    const obj4 = new Parse.Object('MyCollection');
-    obj4.set('language', null);
-    obj4.set('otherField', 4);
-    const obj5 = new Parse.Object('MyCollection');
-    obj5.set('language', 'pt');
-    obj5.set('otherField', 5);
-    const obj6 = new Parse.Object('MyCollection');
-    obj6.set('language', 'pt');
-    obj6.set('otherField', 6);
-    await Parse.Object.saveAll([obj1, obj2, obj3, obj4, obj5, obj6]);
+  it_id('28090280-7c3e-47f8-8bf6-bebf8566a36c')(it_exclude_dbs(['postgres', 'oracle']))(
+    'match null values',
+    async () => {
+      const obj1 = new Parse.Object('MyCollection');
+      obj1.set('language', 'en');
+      obj1.set('otherField', 1);
+      const obj2 = new Parse.Object('MyCollection');
+      obj2.set('language', 'en');
+      obj2.set('otherField', 2);
+      const obj3 = new Parse.Object('MyCollection');
+      obj3.set('language', null);
+      obj3.set('otherField', 3);
+      const obj4 = new Parse.Object('MyCollection');
+      obj4.set('language', null);
+      obj4.set('otherField', 4);
+      const obj5 = new Parse.Object('MyCollection');
+      obj5.set('language', 'pt');
+      obj5.set('otherField', 5);
+      const obj6 = new Parse.Object('MyCollection');
+      obj6.set('language', 'pt');
+      obj6.set('otherField', 6);
+      await Parse.Object.saveAll([obj1, obj2, obj3, obj4, obj5, obj6]);
 
-    expect(
-      (
-        await new Parse.Query('MyCollection').aggregate([
-          {
-            $match: {
-              language: { $in: [null, 'en'] },
+      expect(
+        (
+          await new Parse.Query('MyCollection').aggregate([
+            {
+              $match: {
+                language: { $in: [null, 'en'] },
+              },
             },
-          },
-        ])
-      )
-        .map(value => value.otherField)
-        .sort()
-    ).toEqual([1, 2, 3, 4]);
+          ])
+        )
+          .map(value => value.otherField)
+          .sort()
+      ).toEqual([1, 2, 3, 4]);
 
-    expect(
-      (
-        await new Parse.Query('MyCollection').aggregate([
-          {
-            $match: {
-              $or: [{ language: 'en' }, { language: null }],
+      expect(
+        (
+          await new Parse.Query('MyCollection').aggregate([
+            {
+              $match: {
+                $or: [{ language: 'en' }, { language: null }],
+              },
             },
-          },
-        ])
-      )
-        .map(value => value.otherField)
-        .sort()
-    ).toEqual([1, 2, 3, 4]);
-  });
+          ])
+        )
+          .map(value => value.otherField)
+          .sort()
+      ).toEqual([1, 2, 3, 4]);
+    }
+  );
 
   it_id('df63d1f5-7c37-4ed9-8bc5-20d82f29f509')(it)('project query', done => {
     const options = Object.assign({}, masterKeyOptions, {
@@ -1305,59 +1324,62 @@ describe('Parse.Query Aggregate testing', () => {
       });
   });
 
-  it_id('0a23e791-e9b5-457a-9bf9-9c5ecf406f42')(it_exclude_dbs(['postgres']))('aggregate allow multiple of same stage', async done => {
-    await reconfigureServer({ silent: false });
-    const pointer1 = new TestObject({ value: 1 });
-    const pointer2 = new TestObject({ value: 2 });
-    const pointer3 = new TestObject({ value: 3 });
+  it_id('0a23e791-e9b5-457a-9bf9-9c5ecf406f42')(it_exclude_dbs(['postgres', 'oracle']))(
+    'aggregate allow multiple of same stage',
+    async done => {
+      await reconfigureServer({ silent: false });
+      const pointer1 = new TestObject({ value: 1 });
+      const pointer2 = new TestObject({ value: 2 });
+      const pointer3 = new TestObject({ value: 3 });
 
-    const obj1 = new TestObject({ pointer: pointer1, name: 'Hello' });
-    const obj2 = new TestObject({ pointer: pointer2, name: 'Hello' });
-    const obj3 = new TestObject({ pointer: pointer3, name: 'World' });
+      const obj1 = new TestObject({ pointer: pointer1, name: 'Hello' });
+      const obj2 = new TestObject({ pointer: pointer2, name: 'Hello' });
+      const obj3 = new TestObject({ pointer: pointer3, name: 'World' });
 
-    const options = Object.assign({}, masterKeyOptions, {
-      body: {
-        pipeline: [
-          {
-            $match: { name: 'Hello' },
-          },
-          {
-            // Transform className$objectId to objectId and store in new field tempPointer
-            $project: {
-              tempPointer: { $substr: ['$_p_pointer', 11, -1] }, // Remove TestObject$
+      const options = Object.assign({}, masterKeyOptions, {
+        body: {
+          pipeline: [
+            {
+              $match: { name: 'Hello' },
             },
-          },
-          {
-            // Left Join, replace objectId stored in tempPointer with an actual object
-            $lookup: {
-              from: 'test_TestObject',
-              localField: 'tempPointer',
-              foreignField: '_id',
-              as: 'tempPointer',
+            {
+              // Transform className$objectId to objectId and store in new field tempPointer
+              $project: {
+                tempPointer: { $substr: ['$_p_pointer', 11, -1] }, // Remove TestObject$
+              },
             },
-          },
-          {
-            // lookup returns an array, Deconstructs an array field to objects
-            $unwind: {
-              path: '$tempPointer',
+            {
+              // Left Join, replace objectId stored in tempPointer with an actual object
+              $lookup: {
+                from: 'test_TestObject',
+                localField: 'tempPointer',
+                foreignField: '_id',
+                as: 'tempPointer',
+              },
             },
-          },
-          {
-            $match: { 'tempPointer.value': 2 },
-          },
-        ],
-      },
-    });
-    Parse.Object.saveAll([pointer1, pointer2, pointer3, obj1, obj2, obj3])
-      .then(() => {
-        return get(Parse.serverURL + '/aggregate/TestObject', options);
-      })
-      .then(resp => {
-        expect(resp.results.length).toEqual(1);
-        expect(resp.results[0].tempPointer.value).toEqual(2);
-        done();
+            {
+              // lookup returns an array, Deconstructs an array field to objects
+              $unwind: {
+                path: '$tempPointer',
+              },
+            },
+            {
+              $match: { 'tempPointer.value': 2 },
+            },
+          ],
+        },
       });
-  });
+      Parse.Object.saveAll([pointer1, pointer2, pointer3, obj1, obj2, obj3])
+        .then(() => {
+          return get(Parse.serverURL + '/aggregate/TestObject', options);
+        })
+        .then(resp => {
+          expect(resp.results.length).toEqual(1);
+          expect(resp.results[0].tempPointer.value).toEqual(2);
+          done();
+        });
+    }
+  );
 
   it_only_db('mongo')('aggregate geoNear with location query', async () => {
     // Create geo index which is required for `geoNear` query

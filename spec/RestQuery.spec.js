@@ -52,7 +52,7 @@ describe('rest query', () => {
     sessionToken: 'abc123',
   };
 
-  it_exclude_dbs(['postgres'])(
+  it_exclude_dbs(['postgres', 'oracle'])(
     'query for user w/ legacy credentials without masterKey has them stripped from results',
     done => {
       database
@@ -70,7 +70,7 @@ describe('rest query', () => {
     }
   );
 
-  it_exclude_dbs(['postgres'])(
+  it_exclude_dbs(['postgres', 'oracle'])(
     'query for user w/ legacy credentials with masterKey has them stripped from results',
     done => {
       database
@@ -89,7 +89,7 @@ describe('rest query', () => {
   );
 
   // Created to test a scenario in AnyPic
-  it_exclude_dbs(['postgres'])('query with include', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('query with include', done => {
     let photo = {
       foo: 'bar',
     };

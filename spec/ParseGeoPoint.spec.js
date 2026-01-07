@@ -76,7 +76,7 @@ describe('Parse.GeoPoint testing', () => {
   });
 
   // TODO: This should also have support in postgres, or higher level database agnostic support.
-  it_exclude_dbs(['postgres'])('updating geo point exception two fields', async done => {
+  it_exclude_dbs(['postgres', 'oracle'])('updating geo point exception two fields', async done => {
     const point = new Parse.GeoPoint(20, 20);
     const obj = new TestObject();
     obj.set('locationOne', point);

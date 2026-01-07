@@ -205,7 +205,8 @@ describe('batch', () => {
 
   if (
     process.env.MONGODB_TOPOLOGY === 'replicaset' ||
-    process.env.PARSE_SERVER_TEST_DB === 'postgres'
+    process.env.PARSE_SERVER_TEST_DB === 'postgres' ||
+    process.env.PARSE_SERVER_TEST_DB === 'oracle'
   ) {
     describe('transactions', () => {
       it('should handle a batch request with transaction = true', async () => {
@@ -242,9 +243,7 @@ describe('batch', () => {
         const results = await query.find();
         expect(createSpy.calls.count()).toBe(2);
         for (let i = 0; i + 1 < createSpy.calls.length; i = i + 2) {
-          expect(createSpy.calls.argsFor(i)[3]).toBe(
-            createSpy.calls.argsFor(i + 1)[3]
-          );
+          expect(createSpy.calls.argsFor(i)[3]).toBe(createSpy.calls.argsFor(i + 1)[3]);
         }
         expect(results.map(result => result.get('key')).sort()).toEqual(['value1', 'value2']);
       });

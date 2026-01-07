@@ -4,6 +4,8 @@ const express = require('express');
 const MongoStorageAdapter = require('../lib/Adapters/Storage/Mongo/MongoStorageAdapter').default;
 const PostgresStorageAdapter = require('../lib/Adapters/Storage/Postgres/PostgresStorageAdapter')
   .default;
+const OracleStorageAdapter = require('../lib/Adapters/Storage/Oracle/OracleStorageAdapter')
+  .default;
 const ParseServer = require('../lib/ParseServer').default;
 const path = require('path');
 const { spawn } = require('child_process');
@@ -48,10 +50,16 @@ describe('Server Url Checks', () => {
   xit('handleShutdown, close connection', done => {
     const mongoURI = 'mongodb://localhost:27017/parseServerMongoAdapterTestDatabase';
     const postgresURI = 'postgres://localhost:5432/parse_server_postgres_adapter_test_database';
+    const oracleURI = 'oracle://localhost:1521/freepdb1';
     let databaseAdapter;
     if (process.env.PARSE_SERVER_TEST_DB === 'postgres') {
       databaseAdapter = new PostgresStorageAdapter({
         uri: process.env.PARSE_SERVER_TEST_DATABASE_URI || postgresURI,
+        collectionPrefix: 'test_',
+      });
+    } else if (process.env.PARSE_SERVER_TEST_DB === 'oracle') {
+      databaseAdapter = new OracleStorageAdapter({
+        uri: process.env.PARSE_SERVER_TEST_DATABASE_URI || oracleURI,
         collectionPrefix: 'test_',
       });
     } else {
@@ -65,7 +73,10 @@ describe('Server Url Checks', () => {
       databaseAdapter,
       serverStartComplete: () => {
         let promise = Promise.resolve();
-        if (process.env.PARSE_SERVER_TEST_DB !== 'postgres') {
+        if (
+          process.env.PARSE_SERVER_TEST_DB !== 'postgres' ||
+          process.env.PARSE_SERVER_TEST_DB !== 'oracle'
+        ) {
           promise = parseServer.config.filesController.adapter._connect();
         }
         promise.then(() => {

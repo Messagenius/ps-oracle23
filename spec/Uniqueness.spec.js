@@ -88,7 +88,7 @@ describe('Uniqueness', function () {
       });
   });
 
-  it_exclude_dbs(['postgres'])('can do compound uniqueness', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('can do compound uniqueness', done => {
     const config = Config.get('test');
     config.database.adapter
       .ensureUniqueness(

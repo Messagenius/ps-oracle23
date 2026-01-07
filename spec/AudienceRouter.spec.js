@@ -130,7 +130,7 @@ describe('AudiencesRouter', () => {
       });
   });
 
-  it_exclude_dbs(['postgres'])('query installations with count = 1', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('query installations with count = 1', done => {
     const config = Config.get('test');
     const androidAudienceRequest = {
       name: 'Android Users',
@@ -167,7 +167,7 @@ describe('AudiencesRouter', () => {
       });
   });
 
-  it_exclude_dbs(['postgres'])('query installations with limit = 0 and count = 1', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('query installations with limit = 0 and count = 1', done => {
     const config = Config.get('test');
     const androidAudienceRequest = {
       name: 'Android Users',
@@ -317,7 +317,7 @@ describe('AudiencesRouter', () => {
     );
   });
 
-  it_id('af1111b5-3251-4b40-8f06-fb0fc624fa91')(it_exclude_dbs(['postgres']))('should support legacy parse.com audience fields', done => {
+  it_id('af1111b5-3251-4b40-8f06-fb0fc624fa91')(it_exclude_dbs(['postgres', 'oracle']))('should support legacy parse.com audience fields', done => {
     const database = Config.get(Parse.applicationId).database.adapter.database;
     const now = new Date();
     Parse._request(

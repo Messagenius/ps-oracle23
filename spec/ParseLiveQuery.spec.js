@@ -1160,7 +1160,10 @@ describe('ParseLiveQuery', function () {
       verbose: false,
       silent: true,
     };
-    if (process.env.PARSE_SERVER_TEST_DB === 'postgres') {
+    if (
+      process.env.PARSE_SERVER_TEST_DB === 'postgres' ||
+      process.env.PARSE_SERVER_TEST_DB === 'oracle'
+    ) {
       config.databaseAdapter = new databaseAdapter.constructor({
         uri: databaseURI,
         collectionPrefix: 'test_',

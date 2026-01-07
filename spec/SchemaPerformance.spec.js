@@ -207,7 +207,8 @@ describe('Schema Performance', function () {
 
   it_id('9dd70965-b683-4cb8-b43a-44c1f4def9f4')(it)('does reload with schemaCacheTtl', async () => {
     const databaseURI =
-      process.env.PARSE_SERVER_TEST_DB === 'postgres'
+      process.env.PARSE_SERVER_TEST_DB === 'postgres' ||
+      process.env.PARSE_SERVER_TEST_DB === 'oracle'
         ? process.env.PARSE_SERVER_TEST_DATABASE_URI
         : 'mongodb://localhost:27017/parseServerMongoAdapterTestDatabase';
     await reconfigureServer({

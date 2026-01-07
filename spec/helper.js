@@ -44,6 +44,8 @@ const GridFSBucketAdapter = require('../lib/Adapters/Files/GridFSBucketAdapter')
 const FSAdapter = require('@parse/fs-files-adapter');
 const PostgresStorageAdapter = require('../lib/Adapters/Storage/Postgres/PostgresStorageAdapter')
   .default;
+const OracleStorageAdapter = require('../lib/Adapters/Storage/Oracle/OracleStorageAdapter')
+  .default;
 const MongoStorageAdapter = require('../lib/Adapters/Storage/Mongo/MongoStorageAdapter').default;
 const RedisCacheAdapter = require('../lib/Adapters/Cache/RedisCacheAdapter').default;
 const RESTController = require('parse/lib/node/RESTController');
@@ -51,6 +53,7 @@ const { VolatileClassesSchemas } = require('../lib/Controllers/SchemaController'
 
 const mongoURI = 'mongodb://localhost:27017/parseServerMongoAdapterTestDatabase';
 const postgresURI = 'postgres://localhost:5432/parse_server_postgres_adapter_test_database';
+const oracleURI = 'oracle://localhost:1521/freepdb1';
 let databaseAdapter;
 let databaseURI;
 // need to bind for mocking mocha
@@ -61,6 +64,12 @@ if (process.env.PARSE_SERVER_DATABASE_ADAPTER) {
 } else if (process.env.PARSE_SERVER_TEST_DB === 'postgres') {
   databaseURI = process.env.PARSE_SERVER_TEST_DATABASE_URI || postgresURI;
   databaseAdapter = new PostgresStorageAdapter({
+    uri: databaseURI,
+    collectionPrefix: 'test_',
+  });
+} else if (process.env.PARSE_SERVER_TEST_DB === 'oracle') {
+  databaseURI = process.env.PARSE_SERVER_TEST_DATABASE_URI || oracleURI;
+  databaseAdapter = new OracleStorageAdapter({
     uri: databaseURI,
     collectionPrefix: 'test_',
   });

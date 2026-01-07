@@ -3824,7 +3824,7 @@ describe('Parse.Query testing', () => {
   });
 
   // PG don't support creating a null column
-  it_exclude_dbs(['postgres'])('querying for null value', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('querying for null value', done => {
     const obj = new Parse.Object('TestObject');
     obj.set('aNull', null);
     obj

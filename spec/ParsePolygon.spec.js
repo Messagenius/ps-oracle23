@@ -208,7 +208,10 @@ describe('Parse.Polygon testing', () => {
   });
 
   describe('with location', () => {
-    if (process.env.PARSE_SERVER_TEST_DB !== 'postgres') {
+    if (
+      process.env.PARSE_SERVER_TEST_DB !== 'postgres' ||
+      process.env.PARSE_SERVER_TEST_DB !== 'oracle'
+    ) {
       beforeEach(async () => await TestUtils.destroyAllDataPermanently());
     }
 
@@ -427,7 +430,10 @@ describe_only_db('mongo')('Parse.Polygon testing', () => {
   const Config = require('../lib/Config');
   let config;
   beforeEach(async () => {
-    if (process.env.PARSE_SERVER_TEST_DB !== 'postgres') {
+    if (
+      process.env.PARSE_SERVER_TEST_DB !== 'postgres' ||
+      process.env.PARSE_SERVER_TEST_DB !== 'oracle'
+    ) {
       await TestUtils.destroyAllDataPermanently();
     }
     config = Config.get('test');

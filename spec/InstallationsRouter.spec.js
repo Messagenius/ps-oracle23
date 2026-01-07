@@ -129,7 +129,7 @@ describe('InstallationsRouter', () => {
       });
   });
 
-  it_exclude_dbs(['postgres'])('query installations with count = 1', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('query installations with count = 1', done => {
     const config = Config.get('test');
     const androidDeviceRequest = {
       installationId: '12345678-abcd-abcd-abcd-123456789abc',
@@ -203,7 +203,7 @@ describe('InstallationsRouter', () => {
     expect(response.count).toEqual(2);
   });
 
-  it_exclude_dbs(['postgres'])('query installations with limit = 0 and count = 1', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('query installations with limit = 0 and count = 1', done => {
     const config = Config.get('test');
     const androidDeviceRequest = {
       installationId: '12345678-abcd-abcd-abcd-123456789abc',

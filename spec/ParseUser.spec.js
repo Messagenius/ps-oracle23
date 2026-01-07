@@ -2814,7 +2814,7 @@ describe('Parse.User testing', () => {
     });
   });
 
-  it_exclude_dbs(['postgres'])(
+  it_exclude_dbs(['postgres', 'oracle'])(
     'should cleanup null authData keys (regression test for #935)',
     done => {
       const database = Config.get(Parse.applicationId).database;
@@ -2850,7 +2850,7 @@ describe('Parse.User testing', () => {
     }
   );
 
-  it_exclude_dbs(['postgres'])('should not serve null authData keys', done => {
+  it_exclude_dbs(['postgres', 'oracle'])('should not serve null authData keys', done => {
     const database = Config.get(Parse.applicationId).database;
     database
       .create(
