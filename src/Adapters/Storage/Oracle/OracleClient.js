@@ -1,3 +1,5 @@
+import orcl from 'oracledb';
+
 const parser = require('./OracleConfigParser');
 
 export function createClient(uri, databaseOptions) {
@@ -12,25 +14,22 @@ export function createClient(uri, databaseOptions) {
     dbOptions[key] = databaseOptions[key];
   }
 
-  const initOptions = dbOptions.initOptions || {};
-  initOptions.noWarnings = process && process.env.TESTING;
+  const orcl = require('oracledb');
 
-  const orcl = require('oracle')(initOptions);
-  const client = orcl(dbOptions);
-
-  if (process.env.PARSE_SERVER_LOG_LEVEL === 'debug') {
-    const monitor = require('pg-monitor');
-    if (monitor.isAttached()) {
-      monitor.detach();
-    }
-    monitor.attach(initOptions);
-  }
+  const pool =  orcl.createPool(dbOptions)
+    .then(client => {
+      return client;
+    })
+    .catch(error => {
+      console.error('Error creating Oracle connection pool:', error);
+      throw error;
+    });
 
   if (dbOptions.pgOptions) {
     for (const key in dbOptions.pgOptions) {
-      orcl.pg.defaults[key] = dbOptions.pgOptions[key];
+      orcl.defaults[key] = dbOptions.pgOptions[key];
     }
   }
 
-  return { client, orcl };
+  return { pool, orcl };
 }

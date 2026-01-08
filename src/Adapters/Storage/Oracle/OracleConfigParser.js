@@ -6,16 +6,14 @@ function getDatabaseOptionsFromURI(uri) {
   const queryParams = parseQueryParams(parsedURI.searchParams.toString());
 
   databaseOptions.host = parsedURI.hostname || 'localhost';
-  databaseOptions.port = parsedURI.port ? parseInt(parsedURI.port) : 1337;
-  databaseOptions.database = parsedURI.pathname ? parsedURI.pathname.substring(1) : undefined;
+  databaseOptions.port = parsedURI.port ? parseInt(parsedURI.port) : 1521;
+  databaseOptions.connectString = parsedURI.pathname
+    ? databaseOptions.host + parsedURI.pathname
+    : undefined;
 
   databaseOptions.user = parsedURI.username;
   databaseOptions.password = parsedURI.password;
 
-  databaseOptions.binary =
-    queryParams.binary && queryParams.binary.toLowerCase() === 'true';
-
-  databaseOptions.application_name = queryParams.application_name;
   databaseOptions.fallback_application_name = queryParams.fallback_application_name;
 
   if (queryParams.poolSize) {
