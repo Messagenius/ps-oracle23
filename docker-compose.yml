@@ -1,0 +1,33 @@
+services:
+  parse-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "1337:1337"
+    volumes:
+      - .:/parse-server
+    environment:
+      - PARSE_SERVER_APPLICATION_ID=12345
+      - PARSE_SERVER_MASTER_KEY=123456
+      - PARSE_SERVER_DATABASE_URI=oracle://parseserver:ParseTest123!@oracle:1521/freepdb1
+      - PARSE_SERVER_TEST_DB=oracle
+      - PARSE_SERVER_TEST_DATABASE_URI=oracle://parseserver:ParseTest123!@oracle:1521/freepdb1
+      - NODE_ENV=development
+    depends_on:
+      oracle:
+        condition: service_healthy
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    ports:
+      - "1521:1521"
+    environment:
+      - ORACLE_PASSWORD=ParseTest123!
+      - APP_USER=parseserver
+      - APP_USER_PASSWORD=ParseTest123!
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
