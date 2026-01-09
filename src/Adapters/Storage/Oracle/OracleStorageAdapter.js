@@ -24,6 +24,75 @@ const debug = function (...args: any) {
   log.debug.apply(log, args);
 };
 
+class DDLQueue {
+  _queues: Map<string, Promise<any>> = new Map();
+
+  async enqueue<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const currentQueue = this._queues.get(key) || Promise.resolve();
+
+    const newQueue = currentQueue
+      .then(() => fn())
+      .catch((error) => {
+        console.error(`Error in DDL queue for ${key}:`, error);
+        throw error;
+      });
+
+    this._queues.set(key, newQueue);
+
+    newQueue.finally(() => {
+      if (this._queues.get(key) === newQueue) {
+        this._queues.delete(key);
+      }
+    });
+
+    return newQueue;
+  }
+
+  getActiveQueuesCount(): number {
+    return this._queues.size;
+  }
+}
+
+const ddlQueue = new DDLQueue();
+
+// Утилита для повторных попыток
+async function retryOnLock<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> {
+  let lastError: any;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+
+      // ORA-00054: resource busy
+      // ORA-00060: deadlock detected
+      const shouldRetry = (error.errorNum === 54 || error.errorNum === 60) && attempt < maxRetries;
+
+      if (shouldRetry) {
+        const delay = baseDelay * Math.pow(2, attempt);
+        console.log(`Lock detected (ORA-${String(error.errorNum).padStart(5, '0')}), retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
+export function getDDLQueueStats() {
+  return {
+    activeQueues: ddlQueue.getActiveQueuesCount()
+  };
+}
+
 const parseTypeToOracleType = type => {
   switch (type.type) {
     case 'String':
@@ -1420,109 +1489,118 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
     }
   }
-
   async addFieldIfNotExists(className: string, fieldName: string, type: any, conn?: any) {
     debug('addFieldIfNotExists', className, fieldName);
-
     await this._pgp;
-    const connection = conn || (await this._client.getConnection());
-    const shouldCloseConnection = !conn;
 
-    try {
-      if (type.type !== 'Relation') {
-        const oracleType = parseTypeToOracleType(type);
-        const alterSql = `ALTER TABLE "${className}" ADD ("${fieldName}" ${oracleType})`;
+    return ddlQueue.enqueue(className, async () => {
+      const connection = conn || (await this._client.getConnection());
+      const shouldCloseConnection = !conn;
 
-        try {
-          await connection.execute(alterSql);
-        } catch (error) {
-          // ORA-00942: table or view does not exist
-          if (error.errorNum === 942) {
-            await this.createClass(className, { fields: { [fieldName]: type } }, connection);
-            if (shouldCloseConnection) {
-              await connection.commit();
+      try {
+        await connection.execute(`ALTER SESSION SET DDL_LOCK_TIMEOUT = 30`);
+
+        if (type.type !== 'Relation') {
+          const oracleType = parseTypeToOracleType(type);
+          const alterSql = `ALTER TABLE "${className}" ADD ("${fieldName}" ${oracleType})`;
+
+          await retryOnLock(async () => {
+            try {
+              await connection.execute(alterSql);
+            } catch (error) {
+              // ORA-00942: table or view does not exist
+              if (error.errorNum === 942) {
+                await this.createClass(className, { fields: { [fieldName]: type } }, connection);
+                if (shouldCloseConnection) {
+                  await connection.commit();
+                }
+                this._notifySchemaChange();
+                return;
+              }
+              // ORA-01430: column being added already exists in table
+              if (error.errorNum !== 1430) {
+                throw error;
+              }
             }
-            this._notifySchemaChange();
-            return;
-          }
+          }, 5, 1000);
 
-          // ORA-01430: column being added already exists in table
-          if (error.errorNum !== 1430) {
-            throw error;
-          }
+        } else {
+          const joinTableName = `_Join:${fieldName}:${className}`;
+          const createJoinSql = `
+          CREATE TABLE "${joinTableName}" (
+            "relatedId" VARCHAR2(120),
+            "owningId" VARCHAR2(120),
+            PRIMARY KEY ("relatedId", "owningId")
+          )
+        `;
+
+          await ddlQueue.enqueue(joinTableName, async () => {
+            await retryOnLock(async () => {
+              try {
+                await connection.execute(createJoinSql);
+              } catch (error) {
+                // ORA-00955: name is already used by an existing object
+                if (error.errorNum !== 955) {
+                  throw error;
+                }
+              }
+            }, 5, 1000);
+          });
         }
-      } else {
-        const joinTableName = `_Join:${fieldName}:${className}`;
-        const createJoinSql = `
-        CREATE TABLE "${joinTableName}" (
-          "relatedId" VARCHAR2(120),
-          "owningId" VARCHAR2(120),
-          PRIMARY KEY ("relatedId", "owningId")
-        )
+
+        const checkSql = `
+        SELECT "schema"
+        FROM "_SCHEMA"
+        WHERE "className" = :className
+          AND JSON_EXISTS("schema", '$.fields.${fieldName}')
       `;
 
-        try {
-          await connection.execute(createJoinSql);
-        } catch (error) {
-          // ORA-00955: name is already used by an existing object
-          if (error.errorNum !== 955) {
-            throw error;
-          }
+        const checkResult = await connection.execute(
+          checkSql,
+          { className: className },
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+
+        if (checkResult.rows.length > 0) {
+          throw new Error('Attempted to add a field that already exists');
+        }
+
+        const updateSql = `
+        UPDATE "_SCHEMA"
+        SET "schema" = JSON_MERGEPATCH(
+          "schema",
+          JSON_OBJECT(
+            'fields' VALUE JSON_MERGEPATCH(
+              JSON_QUERY("schema", '$.fields'),
+              JSON_OBJECT(:fieldName VALUE :fieldType FORMAT JSON)
+            ) FORMAT JSON
+          )
+        )
+        WHERE "className" = :className
+      `;
+
+        await connection.execute(updateSql, {
+          className: className,
+          fieldName: fieldName,
+          fieldType: JSON.stringify(type),
+        });
+
+        if (shouldCloseConnection) {
+          await connection.commit();
+        }
+        this._notifySchemaChange();
+
+      } catch (error) {
+        if (shouldCloseConnection) {
+          await connection.rollback();
+        }
+        throw error;
+      } finally {
+        if (shouldCloseConnection && connection) {
+          await connection.close();
         }
       }
-
-      const checkSql = `
-      SELECT "schema"
-      FROM "_SCHEMA"
-      WHERE "className" = :className
-        AND JSON_EXISTS("schema", '$.fields.${fieldName}')
-    `;
-
-      const checkResult = await connection.execute(
-        checkSql,
-        { className: className },
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
-      );
-
-      if (checkResult.rows.length > 0) {
-        throw new Error('Attempted to add a field that already exists');
-      }
-
-      const updateSql = `
-      UPDATE "_SCHEMA"
-      SET "schema" = JSON_MERGEPATCH(
-        "schema",
-        JSON_OBJECT(
-          'fields' VALUE JSON_MERGEPATCH(
-            JSON_QUERY("schema", '$.fields'),
-            JSON_OBJECT(:fieldName VALUE :fieldType FORMAT JSON)
-          ) FORMAT JSON
-        )
-      )
-      WHERE "className" = :className
-    `;
-
-      await connection.execute(updateSql, {
-        className: className,
-        fieldName: fieldName,
-        fieldType: JSON.stringify(type),
-      });
-
-      if (shouldCloseConnection) {
-        await connection.commit();
-      }
-
-      this._notifySchemaChange();
-    } catch (error) {
-      if (shouldCloseConnection) {
-        await connection.rollback();
-      }
-      throw error;
-    } finally {
-      if (shouldCloseConnection && connection) {
-        await connection.close();
-      }
-    }
+    });
   }
 
   async updateFieldOptions(className: string, fieldName: string, type: any) {

@@ -18,6 +18,8 @@ function getDatabaseOptionsFromURI(uri) {
 
   if (queryParams.poolSize) {
     databaseOptions.poolMax = parseInt(queryParams.poolSize) || 10;
+  } else {
+    databaseOptions.poolMax = 10;
   }
   if (queryParams.max) {
     databaseOptions.poolMax = parseInt(queryParams.max) || 10;
@@ -25,15 +27,23 @@ function getDatabaseOptionsFromURI(uri) {
 
   if (queryParams.min) {
     databaseOptions.poolMin = parseInt(queryParams.min) || 4;
+  } else {
+    databaseOptions.poolMin = 4;
   }
 
   if (queryParams.increment) {
     databaseOptions.poolIncrement = parseInt(queryParams.increment) || 1;
+  } else {
+    databaseOptions.poolIncrement = 1;
   }
 
   if (queryParams.timeout) {
-    databaseOptions.poolTimeout = parseInt(queryParams.timeout) || 1000;
+    databaseOptions.poolTimeout = parseInt(queryParams.timeout) || 60;
+  } else {
+    databaseOptions.poolTimeout = 60;
   }
+
+  databaseOptions.queueTimeout = databaseOptions.poolTimeout * 1000;
 
   if (queryParams.ping) {
     databaseOptions.poolPingInterval = parseInt(queryParams.ping) || 10;
