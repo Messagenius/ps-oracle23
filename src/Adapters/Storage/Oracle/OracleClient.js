@@ -1,5 +1,3 @@
-import orcl from 'oracledb';
-
 const parser = require('./OracleConfigParser');
 
 export function createClient(uri, databaseOptions) {
@@ -16,6 +14,7 @@ export function createClient(uri, databaseOptions) {
 
   const orcl = require('oracledb');
 
+  orcl.initOracleClient();
   const pool =  orcl.createPool(dbOptions)
     .then(client => {
       return client;

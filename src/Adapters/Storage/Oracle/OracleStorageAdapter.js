@@ -11,6 +11,7 @@ import type { QueryType, SchemaType } from '../StorageAdapter';
 import { StorageAdapter } from '../StorageAdapter';
 
 import oracledb from 'oracledb';
+import orcl from 'oracledb';
 
 const Utils = require('../../../Utils');
 
@@ -26,7 +27,7 @@ const debug = function (...args: any) {
 const parseTypeToOracleType = type => {
   switch (type.type) {
     case 'String':
-      return 'VARCHAR(32767)';
+      return 'VARCHAR2(4000)';
     case 'Date':
       return 'TIMESTAMP WITH TIME ZONE';
     case 'Object':
@@ -36,9 +37,9 @@ const parseTypeToOracleType = type => {
     case 'Boolean':
       return 'BOOLEAN';
     case 'Pointer':
-      return 'VARCHAR(32767)';
+      return 'VARCHAR2(4000)';
     case 'Number':
-      return 'DOUBLE PRECISION';
+      return 'NUMBER';
     case 'GeoPoint':
       return 'SDO_GEOMETRY';
     case 'Bytes':
@@ -46,7 +47,7 @@ const parseTypeToOracleType = type => {
     case 'Polygon':
       return 'SDO_GEOMETRY';
     case 'Array':
-      return JSON;
+      return 'JSON';
     default:
       throw `no type for ${JSON.stringify(type)} yet`;
   }
@@ -1034,6 +1035,25 @@ export class OracleStorageAdapter implements StorageAdapter {
         });
     }
   }
+  async _setDateFormats() {
+    await this._pgp;
+    const connection = await this._client.getConnection();
+    await connection.execute(`
+    ALTER SESSION SET NLS_DATE_FORMAT = 'DD/MM/YYYY'
+  `);
+
+    await connection.execute(`
+    ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'DD/MM/YYYY HH24:MI:SS.FF'
+  `);
+
+    await connection.execute(`
+    ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'DD/MM/YYYY HH24:MI:SS.FF TZR'
+  `);
+
+    debug('Date formats configured');
+
+    await connection.close();
+  }
 
   async _ensureSchemaCollectionExists(conn: any) {
     const shouldCloseConnection = !conn;
@@ -1072,7 +1092,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     );
 
     if (connection) {
-      connection.close();
+      await connection.close();
     }
 
     return result.rows[0].CNT > 0;
@@ -1274,6 +1294,7 @@ export class OracleStorageAdapter implements StorageAdapter {
   // Just create a table, do not insert in schema
   async createTable(className: string, schema: SchemaType, conn: any) {
     await this._pgp;
+    const shouldCloseConnection = !conn;
     const connection = conn || (await this._client.getConnection());
 
     debug('createTable', className);
@@ -1316,7 +1337,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     });
 
     const createTableSql = `
-      CREATE TABLE "${className}" (
+      CREATE TABLE IF NOT EXISTS "${className}" (
                                     ${columnDefinitions.join(',\n      ')}
       )
     `;
@@ -1351,6 +1372,9 @@ export class OracleStorageAdapter implements StorageAdapter {
           throw error;
         }
       }
+    }
+    if (shouldCloseConnection && connection) {
+      await connection.close();
     }
   }
 
@@ -1512,7 +1536,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
-      const schema = JSON.parse(result.rows[0].schema);
+      const schema = result.rows[0].schema;
       if (!schema.fields) {
         schema.fields = {};
       }
@@ -1599,7 +1623,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
 
       const joins = results.rows.reduce((list, row) => {
-        const schema = JSON.parse(row.schema);
+        const schema = row.schema;
         return list.concat(joinTablesForSchema(schema));
       }, []);
 
@@ -1703,11 +1727,31 @@ export class OracleStorageAdapter implements StorageAdapter {
   // schemas cannot be retrieved, returns a promise that rejects. Requirements for the
   // rejection reason are TBD.
   async getAllClasses() {
-    return this._client.task('get-all-classes', async t => {
-      return await t.map('SELECT * FROM "_SCHEMA"', null, row =>
-        toParseSchema({ className: row.className, ...row.schema })
+    await this._pgp;
+    const connection = await this._client.getConnection();
+
+    try {
+      const result = await connection.execute(
+        'SELECT * FROM "_SCHEMA"',
+        {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
-    });
+
+      return result.rows.map(row =>
+        toParseSchema({
+          className: row.className,
+          ...row.schema
+        })
+      );
+
+    } catch (error) {
+      if (error.errorNum === 942) {
+        return [];
+      }
+      throw error;
+    } finally {
+      await connection.close();
+    }
   }
 
   // Return a promise for the schema with the given name, in Parse format. If
@@ -2423,7 +2467,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
 
       const columnsList = fieldNames.map(field => `"${field}"`).join(', ');
-      const createIndexSql = `CREATE UNIQUE INDEX "${constraintName}" ON "${className}" (${columnsList})`;
+      const createIndexSql = `CREATE UNIQUE INDEX IF NOT EXISTS "${constraintName}" ON "${className}" (${columnsList})`;
 
       await connection.execute(createIndexSql);
       await connection.commit();
@@ -2549,7 +2593,9 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       return results.map(object => this.oracleObjectToParseObject(className, object, schema));
     } catch (error) {
-      if (error.errorNum === 904) return [];
+      if (error.errorNum === 904) {
+        return []
+      }
       throw error;
     } finally {
       await connection.close();
@@ -2810,27 +2856,35 @@ export class OracleStorageAdapter implements StorageAdapter {
         })
         .then(() => this.schemaUpgrade(schema.className, schema));
     });
+
+    await this._setDateFormats();
+
     promises.push(this._listenToSchema());
-    return Promise.all(promises)
-      .then(() => {
-        return this._client.tx('perform-initialization', async t => {
-          await t.none(sql.misc.jsonObjectSetKeys);
-          await t.none(sql.array.add);
-          await t.none(sql.array.addUnique);
-          await t.none(sql.array.remove);
-          await t.none(sql.array.containsAll);
-          await t.none(sql.array.containsAllRegex);
-          await t.none(sql.array.contains);
-          return t.ctx;
-        });
-      })
-      .then(ctx => {
-        debug(`initializationDone in ${ctx.duration}`);
-      })
+    promises.push(this._installOracleFunctions());
+
+    const start = Date.now();
+    await Promise.all(promises)
       .catch(error => {
         /* eslint-disable no-console */
         console.error(error);
       });
+
+    debug(`initializationDone in ${Date.now() - start}`);
+  }
+
+  async _installOracleFunctions() {
+    await this._pgp;
+    const connection = await this._client.getConnection();
+
+    connection.execute(sql.misc.jsonObjectSetKeys);
+    connection.execute(sql.array.add);
+    connection.execute(sql.array.addUnique);
+    connection.execute(sql.array.remove);
+    connection.execute(sql.array.containsAll);
+    connection.execute(sql.array.containsAllRegex);
+    connection.execute(sql.array.contains);
+
+    connection.close();
   }
 
   async createIndexes(className: string, indexes: any, conn?: any): Promise<void> {
@@ -2959,6 +3013,7 @@ export class OracleStorageAdapter implements StorageAdapter {
   async getIndexes(className: string) {
     debug('getIndexes', className);
 
+    let connection;
     try {
       const sql = `
       SELECT 
@@ -2972,7 +3027,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     `;
 
       await this._pgp;
-      const connection = await this._client.getConnection();
+      connection = await this._client.getConnection();
 
       const result = await connection.execute(
         sql,
@@ -3046,6 +3101,10 @@ export class OracleStorageAdapter implements StorageAdapter {
       committed: false,
       aborted: false,
     };
+
+    if (connection) {
+      await connection.close();
+    }
 
     return transactionalSession;
   }
@@ -3130,7 +3189,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         columnsList = fieldNames.map(field => `"${field}"`).join(', ');
       }
 
-      const createIndexSql = `CREATE INDEX "${finalIndexName}" ON "${className}" (${columnsList})`;
+      const createIndexSql = `CREATE INDEX IF NOT EXISTS "${finalIndexName}" ON "${className}" (${columnsList})`;
 
       if (options.setIdempotencyFunction) {
         await this.ensureIdempotencyFunctionExists(options);
