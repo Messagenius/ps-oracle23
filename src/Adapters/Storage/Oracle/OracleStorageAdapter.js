@@ -388,15 +388,13 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       // TODO: Handle querying by _auth_data_provider, authData is stored in authData field
       continue;
     } else if (caseInsensitive && (fieldName === 'username' || fieldName === 'email')) {
-      const nameParam = getBindName('field');
       const valueParam = getBindName('val');
-      patterns.push(`LOWER(${nameParam}) = LOWER(:${valueParam})`);
-      binds[nameParam] = fieldName;
+      patterns.push(`LOWER("${fieldName}") = LOWER(:${valueParam})`);
       binds[valueParam] = fieldValue;
     } else if (fieldName.indexOf('.') >= 0) {
       let name = transformDotField(fieldName);
       if (fieldValue === null) {
-        patterns.push(`${name} IS NULL`);
+        patterns.push(`"${name}" IS NULL`);
         continue;
       } else {
         if (fieldValue.$in) {
@@ -408,20 +406,20 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
           // Handle later
         } else if (typeof fieldValue !== 'object') {
           const valueParam = getBindName('val');
-          patterns.push(`${name} = :${valueParam}`);
+          patterns.push(`"${name}" = :${valueParam}`);
           binds[valueParam] = fieldValue;
         }
       }
     } else if (fieldValue === null || fieldValue === undefined) {
-      patterns.push(`${fieldName} IS NULL`);
+      patterns.push(`"${fieldName}" IS NULL`);
       continue;
     } else if (typeof fieldValue === 'string') {
       const valueParam = getBindName('val');
-      patterns.push(`${fieldName} = :${valueParam}`);
+      patterns.push(`"${fieldName}" = :${valueParam}`);
       binds[valueParam] = fieldValue;
     } else if (typeof fieldValue === 'boolean') {
       const valueParam = getBindName('val');
-      patterns.push(`${fieldName} = :${valueParam}`);
+      patterns.push(`"${fieldName}" = :${valueParam}`);
       // Can't cast boolean to number
       if (schema.fields[fieldName] && schema.fields[fieldName].type === 'Number') {
         // Should always return zero results
@@ -431,7 +429,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       }
     } else if (typeof fieldValue === 'number') {
       const valueParam = getBindName('val');
-      patterns.push(`${fieldName} = :${valueParam}`);
+      patterns.push(`"${fieldName}" = :${valueParam}`);
       binds[valueParam] = fieldValue;
     } else if (['$or', '$nor', '$and'].includes(fieldName)) {
       const clauses = [];
@@ -461,7 +459,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
         binds[valueParam] = fieldValue.$ne;
       } else {
         if (fieldValue.$ne === null) {
-          patterns.push(`${fieldName} IS NOT NULL`);
+          patterns.push(`"${fieldName}" IS NOT NULL`);
           continue;
         } else {
           // if not null, we need to manually exclude null
@@ -469,7 +467,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
             const lonParam = getBindName('lon');
             const latParam = getBindName('lat');
             patterns.push(
-              `(${fieldName} <> SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL) OR ${fieldName} IS NULL)`
+              `("${fieldName}" <> SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL) OR "${fieldName}" IS NULL)`
             );
             binds[lonParam] = fieldValue.$ne.longitude;
             binds[latParam] = fieldValue.$ne.latitude;
@@ -477,7 +475,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
             if (fieldName.indexOf('.') >= 0) {
               const castType = toOracleValueCastType(fieldValue.$ne);
               const constraintFieldName = castType
-                ? `CAST(${transformDotField(fieldName)} AS ${castType})`
+                ? `CAST("${transformDotField(fieldName)}" AS ${castType})`
                 : transformDotField(fieldName);
               const valueParam = getBindName('val');
               patterns.push(
@@ -491,7 +489,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
               );
             } else {
               const valueParam = getBindName('val');
-              patterns.push(`(${fieldName} <> :${valueParam} OR ${fieldName} IS NULL)`);
+              patterns.push(`("${fieldName}" <> :${valueParam} OR "${fieldName}" IS NULL)`);
               binds[valueParam] = fieldValue.$ne;
             }
           }
@@ -501,13 +499,13 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
 
     if (fieldValue.$eq !== undefined) {
       if (fieldValue.$eq === null) {
-        patterns.push(`${fieldName} IS NULL`);
+        patterns.push(`"${fieldName}" IS NULL`);
       } else {
         if (fieldName.indexOf('.') >= 0) {
           const castType = toOracleValueCastType(fieldValue.$eq);
           const constraintFieldName = castType
-            ? `CAST(${transformDotField(fieldName)} AS ${castType})`
-            : transformDotField(fieldName);
+            ? `CAST("${transformDotField(fieldName)}" AS ${castType})`
+            : `"${transformDotField(fieldName)}"`;
           const valueParam = getBindName('val');
           patterns.push(`${constraintFieldName} = :${valueParam}`);
           binds[valueParam] = fieldValue.$eq;
@@ -546,9 +544,9 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       });
 
       if (allowNull) {
-        patterns.push(`(${fieldName} IS NULL OR ${fieldName} IN (${inPatterns.join(',')}))`);
+        patterns.push(`("${fieldName}" IS NULL OR "${fieldName}" IN (${inPatterns.join(',')}))`);
       } else {
-        patterns.push(`${fieldName} IN (${inPatterns.join(',')})`);
+        patterns.push(`"${fieldName}" IN (${inPatterns.join(',')})`);
       }
     } else if (isInOrNin) {
       const createConstraint = (baseArray, notIn) => {
@@ -571,10 +569,10 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
                 inPatterns.push(`:${valueParam}`);
               }
             });
-            patterns.push(`${fieldName}${not} IN (${inPatterns.join(',')})`);
+            patterns.push(`"${fieldName}"${not} IN (${inPatterns.join(',')})`);
           }
         } else if (!notIn) {
-          patterns.push(`${fieldName} IS NULL`);
+          patterns.push(`"${fieldName}" IS NULL`);
         } else {
           // Handle empty array
           if (notIn) {
@@ -625,7 +623,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
     } else if (Array.isArray(fieldValue.$all)) {
       if (fieldValue.$all.length === 1) {
         const valueParam = getBindName('val');
-        patterns.push(`${fieldName} = :${valueParam}`);
+        patterns.push(`"${fieldName}" = :${valueParam}`);
         binds[valueParam] = fieldValue.$all[0].objectId;
       }
     }
@@ -637,9 +635,9 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
           '$relativeTime can only be used with the $lt, $lte, $gt, and $gte operators'
         );
       } else if (fieldValue.$exists) {
-        patterns.push(`${fieldName} IS NOT NULL`);
+        patterns.push(`"${fieldName}" IS NOT NULL`);
       } else {
-        patterns.push(`${fieldName} IS NULL`);
+        patterns.push(`"${fieldName}" IS NULL`);
       }
     }
 
@@ -650,7 +648,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       }
       const valueParam = getBindName('val');
       // Oracle: использование JSON_QUERY для проверки вхождения
-      patterns.push(`JSON_EXISTS(${fieldName}, '$[*]?(@.value in ($${valueParam}))')`);
+      patterns.push(`JSON_EXISTS("${fieldName}", '$[*]?(@.value in ($${valueParam}))')`);
       binds[valueParam] = JSON.stringify(arr);
     }
 
@@ -685,7 +683,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
 
       const termParam = getBindName('term');
       // Oracle Text: CONTAINS operator
-      patterns.push(`CONTAINS(${fieldName}, :${termParam}) > 0`);
+      patterns.push(`CONTAINS("${fieldName}", :${termParam}) > 0`);
       binds[termParam] = search.$term;
     }
 
@@ -719,7 +717,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
 
       const boxParam = getBindName('box');
       patterns.push(
-        `SDO_RELATE(${fieldName}, SDO_GEOMETRY(2003, NULL, NULL, SDO_ELEM_INFO_ARRAY(1,1003,3), SDO_ORDINATE_ARRAY(:${boxParam}_minx, :${boxParam}_miny, :${boxParam}_maxx, :${boxParam}_maxy)), 'mask=INSIDE') = 'TRUE'`
+        `SDO_RELATE("${fieldName}", SDO_GEOMETRY(2003, NULL, NULL, SDO_ELEM_INFO_ARRAY(1,1003,3), SDO_ORDINATE_ARRAY(:${boxParam}_minx, :${boxParam}_miny, :${boxParam}_maxx, :${boxParam}_maxy)), 'mask=INSIDE') = 'TRUE'`
       );
       binds[`${boxParam}_minx`] = left;
       binds[`${boxParam}_miny`] = bottom;
@@ -815,7 +813,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       });
 
       patterns.push(
-        `SDO_RELATE(${fieldName}, SDO_GEOMETRY(2003, NULL, NULL, SDO_ELEM_INFO_ARRAY(1,1003,1), SDO_ORDINATE_ARRAY(${ordinateBinds})), 'mask=INSIDE') = 'TRUE'`
+        `SDO_RELATE("${fieldName}", SDO_GEOMETRY(2003, NULL, NULL, SDO_ELEM_INFO_ARRAY(1,1003,1), SDO_ORDINATE_ARRAY(${ordinateBinds})), 'mask=INSIDE') = 'TRUE'`
       );
     }
 
@@ -859,11 +857,11 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       const regexParam = getBindName('regex');
       if (regexOpts) {
         const optsParam = getBindName('opts');
-        patterns.push(`REGEXP_LIKE(${name}, :${regexParam}, :${optsParam})`);
+        patterns.push(`REGEXP_LIKE("${name}", :${regexParam}, :${optsParam})`);
         binds[regexParam] = regex;
         binds[optsParam] = regexOpts;
       } else {
-        patterns.push(`REGEXP_LIKE(${name}, :${regexParam})`);
+        patterns.push(`REGEXP_LIKE("${name}", :${regexParam})`);
         binds[regexParam] = regex;
       }
     }
@@ -871,10 +869,10 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
     if (fieldValue.__type === 'Pointer') {
       const valueParam = getBindName('val');
       if (isArrayField) {
-        patterns.push(`array_contains(${fieldName}, :${valueParam})`);
+        patterns.push(`array_contains("${fieldName}", :${valueParam})`);
         binds[valueParam] = JSON.stringify([fieldValue]);
       } else {
-        patterns.push(`${fieldName} = :${valueParam}`);
+        patterns.push(`"${fieldName}" = :${valueParam}`);
         binds[valueParam] = fieldValue.objectId;
       }
     }
@@ -891,7 +889,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       const lonParam = getBindName('lon');
       const latParam = getBindName('lat');
       patterns.push(
-        `SDO_GEOM.SDO_DISTANCE(${fieldName}, SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL), 0.005) < 0.001`
+        `SDO_GEOM.SDO_DISTANCE("${fieldName}", SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:${lonParam}, :${latParam}, NULL), NULL, NULL), 0.005) < 0.001`
       );
       binds[lonParam] = fieldValue.longitude;
       binds[latParam] = fieldValue.latitude;
@@ -913,7 +911,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
         if (fieldName.indexOf('.') >= 0) {
           const castType = toOracleValueCastType(fieldValue[cmp]);
           constraintFieldName = castType
-            ? `CAST(${transformDotField(fieldName)} AS ${castType})`
+            ? `CAST("${transformDotField(fieldName)}" AS ${castType})`
             : transformDotField(fieldName);
         } else {
           if (typeof oracleValue === 'object' && oracleValue.$relativeTime) {
@@ -1857,6 +1855,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     object: any,
     transactionalSession?: any
   ) {
+    console.log("0");
     debug('createObject', className);
 
     const columnsArray = [];
@@ -1919,11 +1918,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           valuesArray.push(object[fieldName].objectId);
           break;
         case 'Array':
-          if (['_rperm', '_wperm'].indexOf(fieldName) >= 0) {
-            valuesArray.push(object[fieldName]);
-          } else {
-            valuesArray.push(JSON.stringify(object[fieldName]));
-          }
+          valuesArray.push(JSON.stringify(object[fieldName]));
           break;
         case 'Object':
         case 'Bytes':
@@ -1951,10 +1946,17 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     const allColumns = [...columnsArray, ...Object.keys(geoPoints)];
     const binds = {};
+    console.log(schema.fields);
+    console.log(columnsArray);
+
 
     columnsArray.forEach((col, index) => {
       const bindName = `val${index}`;
-      binds[bindName] = valuesArray[index];
+      if (['Array', 'Bytes', 'Object'].includes(schema.fields[col].type)) {
+        binds[bindName] = JSON.stringify(valuesArray[index]);
+      } else {
+        binds[bindName] = valuesArray[index];
+      }
     });
 
     Object.keys(geoPoints).forEach((key, index) => {
@@ -1966,7 +1968,11 @@ export class OracleStorageAdapter implements StorageAdapter {
     const columnsList = allColumns.map(col => `"${col}"`).join(', ');
 
     const valuesList = [
-      ...columnsArray.map((col, i) => `:val${i}`),
+      ...columnsArray.map((col, i) => (schema.fields[col].type === 'Date') ?
+        `TO_TIMESTAMP(:val${i}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`
+        :
+        `:val${i}`
+      ),
       ...Object.keys(geoPoints).map(
         (key, i) =>
           `SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:geo${i}_lon, :geo${i}_lat, NULL), NULL, NULL)`
@@ -1981,6 +1987,7 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     try {
       await connection.execute(insertSql, binds);
+      console.log('executed_' + className);
 
       if (shouldCloseConnection) {
         await connection.commit();
@@ -1988,6 +1995,9 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       return { ops: [object] };
     } catch (error) {
+      console.log(insertSql);
+      console.log(binds);
+      console.log(error);
       if (shouldCloseConnection) {
         await connection.rollback();
       }
@@ -2334,6 +2344,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     update: any,
     transactionalSession: ?any
   ) {
+    await this._pgp
     debug('upsertOneObject');
     const createValue = Object.assign({}, query, update);
     return this.createObject(className, schema, createValue, transactionalSession).catch(error => {
@@ -2349,11 +2360,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     debug('find', className);
 
     const { skip, limit, sort, keys, caseInsensitive, explain } = options;
-
     const where = buildWhereClause({ schema, query, caseInsensitive });
     const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
-
-    // Сортировка
     let sortPattern = '';
     if (sort && Object.keys(sort).length > 0) {
       const sorting = Object.keys(sort)
@@ -2411,6 +2419,15 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       return result.rows.map(obj => this.oracleObjectToParseObject(className, obj, schema));
     } catch (error) {
+      console.log(schema);
+      console.log(className);
+      console.log(query);
+      console.log(where);
+      console.log(dataQuery);
+      console.log(error);
+      console.log("======================");
+
+
       if (error.errorNum === 942) {
         return [];
       }
