@@ -516,26 +516,16 @@ describe('DatabaseController', function () {
       await reconfigureServer({ convertEmailToLowercase: true });
       const user = new Parse.User();
       await user.save({ username: 'EXAMPLE', email: 'EXAMPLE@EXAMPLE.COM', password: 'password' })
-    .catch(error => {
-        console.log(error);
-      });
-
       const query = new Parse.Query(Parse.User);
       query.equalTo('email', 'EXAMPLE@EXAMPLE.COM')
-      const result = await query.find({ useMasterKey: true }).catch(error => {
-        console.log('first find');
-        console.log(error);
-      });;
+      const result = await query.find({ useMasterKey: true });
+
       expect(result.length).toEqual(0);
 
       const query2 = new Parse.Query(Parse.User);
       query2.equalTo('email', 'example@example.com')
-      const result2 = await query2.find({ useMasterKey: true }).catch(error => {
-        console.log('second find');
-        console.log(error);
-      });
+      const result2 = await query2.find({ useMasterKey: true })
       expect(result2.length).toEqual(1);
-
     });
   });
 
@@ -613,27 +603,16 @@ describe('DatabaseController', function () {
       await reconfigureServer({ convertUsernameToLowercase: true });
       const user = new Parse.User();
       await user.save({ username: 'EXAMPLE', password: 'password' })
-    .catch(error => {
-        console.log(error.message);
-      });
-
-      console.log(user);
 
       const query = new Parse.Query(Parse.User);
       query.equalTo('username', 'EXAMPLE');
-      const result = await query.find({ useMasterKey: true }).catch(error => {
-        console.log('111111111111111111111');
-        console.log(error.message);
-      });
-      ;
+      const result = await query.find({ useMasterKey: true });
+
       expect(result.length).toEqual(0);
 
       const query2 = new Parse.Query(Parse.User);
       query2.equalTo('username', 'example');
-      const result2 = await query2.find({ useMasterKey: true }).catch(error => {
-        console.log('2222222222222222222222222222222222');
-        console.log(error.message);
-      });
+      const result2 = await query2.find({ useMasterKey: true })
       expect(result2.length).toEqual(1);
     });
   });

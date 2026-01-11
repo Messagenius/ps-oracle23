@@ -1855,7 +1855,6 @@ export class OracleStorageAdapter implements StorageAdapter {
     object: any,
     transactionalSession?: any
   ) {
-    console.log("0");
     debug('createObject', className);
 
     const columnsArray = [];
@@ -1946,8 +1945,6 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     const allColumns = [...columnsArray, ...Object.keys(geoPoints)];
     const binds = {};
-    console.log(schema.fields);
-    console.log(columnsArray);
 
 
     columnsArray.forEach((col, index) => {
@@ -1987,7 +1984,6 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     try {
       await connection.execute(insertSql, binds);
-      console.log('executed_' + className);
 
       if (shouldCloseConnection) {
         await connection.commit();
@@ -1995,9 +1991,6 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       return { ops: [object] };
     } catch (error) {
-      console.log(insertSql);
-      console.log(binds);
-      console.log(error);
       if (shouldCloseConnection) {
         await connection.rollback();
       }
@@ -2362,6 +2355,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     const { skip, limit, sort, keys, caseInsensitive, explain } = options;
     const where = buildWhereClause({ schema, query, caseInsensitive });
     const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
+    
     let sortPattern = '';
     if (sort && Object.keys(sort).length > 0) {
       const sorting = Object.keys(sort)
@@ -2413,21 +2407,16 @@ export class OracleStorageAdapter implements StorageAdapter {
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
+
       if (explain) {
         return result.rows;
       }
 
-      return result.rows.map(obj => this.oracleObjectToParseObject(className, obj, schema));
+      const mappedResults = result.rows.map(obj => this.oracleObjectToParseObject(className, obj, schema));
+      
+
+      return mappedResults;
     } catch (error) {
-      console.log(schema);
-      console.log(className);
-      console.log(query);
-      console.log(where);
-      console.log(dataQuery);
-      console.log(error);
-      console.log("======================");
-
-
       if (error.errorNum === 942) {
         return [];
       }
@@ -2525,6 +2514,14 @@ export class OracleStorageAdapter implements StorageAdapter {
           __type: 'Date',
           iso: object[fieldName].toISOString(),
         };
+      }
+      // Parse JSON strings for permission fields
+      if ((fieldName === '_rperm' || fieldName === '_wperm') && typeof object[fieldName] === 'string') {
+        try {
+          object[fieldName] = JSON.parse(object[fieldName]);
+        } catch (e) {
+          // If parsing fails, keep as string (fallback)
+        }
       }
     }
 

@@ -1,8 +1,12 @@
 {
   "spec_dir": "spec",
   "spec_files": [
-    "**/DatabaseController.spec.js"
-   ],
+    "**/DatabaseController.spec.js",
+    "**/PostgresConfigParser.spec.js",
+    "**/PostgresInitOptions.spec.js",
+    "**/PostgresStorageAdapter.spec.js",
+    "**/ParseAPI.spec.js"
+  ],
   "helpers": ["helper.js"],
   "random": false
 }

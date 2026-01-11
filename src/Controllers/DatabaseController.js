@@ -1230,6 +1230,18 @@ class DatabaseController {
             sort.updatedAt = sort._updated_at;
             delete sort._updated_at;
           }
+          // Enable case-insensitive queries for email/username validation during user creation
+          let shouldUseCaseInsensitive = caseInsensitive;
+          if (!this.options.enableCollationCaseComparison && className === '_User') {
+            // Only enable case-insensitive for validation queries (those with objectId.$ne)
+            const isValidationQuery = query.objectId && query.objectId.$ne;
+            if (isValidationQuery && 
+                ((this.options.convertEmailToLowercase && query.email !== undefined) ||
+                 (this.options.convertUsernameToLowercase && query.username !== undefined))) {
+              shouldUseCaseInsensitive = true;
+            }
+          }
+
           const queryOptions = {
             skip,
             limit,
@@ -1237,7 +1249,7 @@ class DatabaseController {
             keys,
             readPreference,
             hint,
-            caseInsensitive: this.options.enableCollationCaseComparison ? false : caseInsensitive,
+            caseInsensitive: this.options.enableCollationCaseComparison ? false : shouldUseCaseInsensitive,
             explain,
             comment,
           };
