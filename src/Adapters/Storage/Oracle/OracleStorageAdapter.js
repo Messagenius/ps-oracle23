@@ -32,7 +32,7 @@ class DDLQueue {
 
     const newQueue = currentQueue
       .then(() => fn())
-      .catch((error) => {
+      .catch(error => {
         console.error(`Error in DDL queue for ${key}:`, error);
         throw error;
       });
@@ -75,7 +75,12 @@ async function retryOnLock<T>(
 
       if (shouldRetry) {
         const delay = baseDelay * Math.pow(2, attempt);
-        console.log(`Lock detected (ORA-${String(error.errorNum).padStart(5, '0')}), retrying in ${delay}ms...`);
+        console.log(
+          `Lock detected (ORA-${String(error.errorNum).padStart(
+            5,
+            '0'
+          )}), retrying in ${delay}ms...`
+        );
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
@@ -89,7 +94,7 @@ async function retryOnLock<T>(
 
 export function getDDLQueueStats() {
   return {
-    activeQueues: ddlQueue.getActiveQueuesCount()
+    activeQueues: ddlQueue.getActiveQueuesCount(),
   };
 }
 
@@ -966,6 +971,9 @@ export class OracleStorageAdapter implements StorageAdapter {
   _pgp: any;
   _stream: any;
   _uuid: any;
+  _connectOptions: object;
+  _pollingConnection: any;
+  _isPolling: boolean;
   schemaCacheTtl: ?number;
 
   constructor({ uri, collectionPrefix = '', databaseOptions = {} }: any) {
@@ -977,11 +985,12 @@ export class OracleStorageAdapter implements StorageAdapter {
       delete options[key];
     }
 
-    const { pool, orcl } = createClient(uri, options);
+    const { pool, orcl, connectOptions } = createClient(uri, options);
 
     this._client = orcl;
     this._onchange = () => {};
     this._pgp = pool;
+    this._connectOptions = connectOptions;
     this._uuid = uuidv4();
     this.canSortOnJoinTables = false;
   }
@@ -1069,37 +1078,199 @@ export class OracleStorageAdapter implements StorageAdapter {
       throw error;
     }
   }
-  handleShutdown() {
-    if (this._stream) {
-      this._stream.done();
-      delete this._stream;
+  async handleShutdown() {
+    const stream = this._stream;
+    if (stream && stream.type === 'polling' && stream.interval) {
+      clearInterval(stream.interval);
     }
-    if (!this._client) {
-      return;
+    if (this._pollingInterval) {
+      clearInterval(this._pollingInterval);
+      this._pollingInterval = null;
     }
-    this._client.$pool.end();
+    if (this._schemaPollingInterval) {
+      clearInterval(this._schemaPollingInterval);
+      this._schemaPollingInterval = null;
+    }
+    if (this._schemaChangeInterval) {
+      clearInterval(this._schemaChangeInterval);
+      this._schemaChangeInterval = null;
+    }
+
+    let attempts = 0;
+    while (this._isPolling && attempts < 50) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      attempts++;
+    }
+
+    if (this._pollingConnection) {
+      try {
+        await this._pollingConnection.close();
+      } catch (error) {
+        console.error('Error closing polling connection:', error);
+      }
+      this._pollingConnection = null;
+    }
+
+    this._stream = null;
+    this._isPolling = false;
+
+    // Close connection pool if it was created
+    try {
+      const pool = await this._pgp;
+      if (pool && typeof pool.close === 'function') {
+        await pool.close();
+      }
+    } catch (e) {
+      console.error('Error closing Oracle pool:', e);
+    }
   }
 
   async _listenToSchema() {
-    if (!this._stream && this.enableSchemaHooks) {
-      this._stream = await this._client.connect({ direct: true });
-      this._stream.client.on('notification', data => {
-        const payload = JSON.parse(data.payload);
-        if (payload.senderId !== this._uuid) {
-          this._onchange();
+    await this._pgp;
+    if (this._stream || !this.enableSchemaHooks) {
+      return;
+    }
+
+    try {
+      const setupConn = await this._client.getConnection();
+      try {
+        await setupConn.execute(`
+        DECLARE
+          table_exists NUMBER;
+        BEGIN
+          SELECT COUNT(*) INTO table_exists 
+          FROM USER_TABLES 
+          WHERE TABLE_NAME = '_SchemaChangeLog';
+          
+          IF table_exists = 0 THEN
+            EXECUTE IMMEDIATE 'CREATE TABLE "_SchemaChangeLog" (
+              "senderId" VARCHAR2(100) PRIMARY KEY,
+              "lastChange" TIMESTAMP NOT NULL
+            )';
+          END IF;
+        END;
+      `);
+      } finally {
+        await setupConn.close();
+      }
+
+      // Initialize to a time slightly in the past to ensure we catch changes that happen immediately
+      this._lastKnownChange = new Date(Date.now() - 10000);
+      this._isPolling = false;
+
+      this._pollingConnection = await this._client.getConnection(this._connectOptions);
+
+      // Set _stream before starting the interval to ensure _notifySchemaChange can work
+      this._stream = { polling: true };
+
+      this._schemaChangeInterval = setInterval(async () => {
+        if (this._isPolling) {
+          console.log('Previous poll still running, skipping...');
+          return;
         }
-      });
-      await this._stream.none('LISTEN $1~', 'schema.change');
+
+        this._isPolling = true;
+
+        try {
+          const result = await this._pollingConnection.execute(
+            `SELECT "senderId", "lastChange"
+           FROM "_SchemaChangeLog"
+           WHERE "lastChange" > :lastCheck
+             AND "senderId" != :uuid`,
+            {
+              lastCheck: this._lastKnownChange,
+              uuid: this._uuid,
+            },
+            { outFormat: oracledb.OUT_FORMAT_OBJECT }
+          );
+          if (result.rows && result.rows.length > 0) {
+            this._onchange();
+
+            this._lastKnownChange = result.rows.reduce((latest, row) => {
+              const rowTime = new Date(row.lastChange);
+              return rowTime > latest ? rowTime : latest;
+            }, this._lastKnownChange);
+          }
+        } catch (error) {
+          console.error('Error in schema polling:', error);
+        } finally {
+          this._isPolling = false;
+        }
+      }, 2000);
+      console.log('Schema polling started successfully');
+    } catch (error) {
+      console.error('Failed to setup schema listener:', error);
+      await this._cleanupSchemaListener();
+      throw error;
     }
   }
 
-  _notifySchemaChange() {
-    if (this._stream) {
-      this._stream
-        .none('NOTIFY $1~, $2', ['schema.change', { senderId: this._uuid }])
-        .catch(error => {
-          console.log('Failed to Notify:', error); // unlikely to ever happen
-        });
+  async _cleanupSchemaListener() {
+    console.log('Cleaning up schema listener...');
+
+    if (this._schemaChangeInterval) {
+      clearInterval(this._schemaChangeInterval);
+      this._schemaChangeInterval = null;
+    }
+
+    let attempts = 0;
+    while (this._isPolling && attempts < 50) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      attempts++;
+    }
+
+    if (this._pollingConnection) {
+      try {
+        await this._pollingConnection.close();
+      } catch (error) {
+        console.error('Error closing polling connection:', error);
+      }
+      this._pollingConnection = null;
+    }
+
+    this._stream = null;
+    this._isPolling = false;
+
+    console.log('Schema listener cleaned up');
+  }
+
+  async _notifySchemaChange() {
+    if (!this._stream) return;
+
+    const connection = await this._client.getConnection();
+
+    try {
+      // Сначала пробуем UPDATE
+      const result = await connection.execute(`
+      UPDATE "_SchemaChangeLog"
+      SET "lastChange" = SYSTIMESTAMP
+      WHERE "senderId" = :senderId
+    `, {
+        senderId: this._uuid
+      });
+
+      // Если запись не существует, делаем INSERT
+      if (result.rowsAffected === 0) {
+        try {
+          await connection.execute(`
+          INSERT INTO "_SchemaChangeLog" ("senderId", "lastChange")
+          VALUES (:senderId, SYSTIMESTAMP)
+        `, {
+            senderId: this._uuid
+          });
+        } catch (insertError) {
+          // Игнорируем ошибку дубликата - другой процесс вставил одновременно
+          if (insertError.errorNum !== 1) {
+            throw insertError;
+          }
+        }
+      }
+
+      await connection.commit();
+    } catch (error) {
+      console.log('Failed to notify schema change:', error);
+    } finally {
+      await connection.close();
     }
   }
   async _setDateFormats() {
@@ -1500,28 +1671,47 @@ export class OracleStorageAdapter implements StorageAdapter {
 
         if (type.type !== 'Relation') {
           const oracleType = parseTypeToOracleType(type);
-          const alterSql = `ALTER TABLE "${className}" ADD ("${fieldName}" ${oracleType})`;
+          const alterSql = `DECLARE
+            v_count NUMBER;
+            BEGIN
+              SELECT COUNT(*)
+              INTO v_count
+              FROM user_tab_cols
+              WHERE table_name  = '${className}'
+                AND column_name = '${fieldName}';
 
-          await retryOnLock(async () => {
-            try {
-              await connection.execute(alterSql);
-            } catch (error) {
-              // ORA-00942: table or view does not exist
-              if (error.errorNum === 942) {
-                await this.createClass(className, { fields: { [fieldName]: type } }, connection);
-                if (shouldCloseConnection) {
-                  await connection.commit();
+              IF v_count = 0 THEN
+                EXECUTE IMMEDIATE '
+                  ALTER TABLE "${className}"
+                  ADD "${fieldName}" ${oracleType}
+                ';
+              END IF;
+          END;
+         `;
+
+          await retryOnLock(
+            async () => {
+              try {
+                await connection.execute(alterSql);
+              } catch (error) {
+                // ORA-00942: table or view does not exist
+                if (error.errorNum === 942) {
+                  await this.createClass(className, { fields: { [fieldName]: type } }, connection);
+                  if (shouldCloseConnection) {
+                    await connection.commit();
+                  }
+                  this._notifySchemaChange();
+                  return;
                 }
-                this._notifySchemaChange();
-                return;
+                // ORA-01430: column being added already exists in table
+                if (error.errorNum !== 1430) {
+                  throw error;
+                }
               }
-              // ORA-01430: column being added already exists in table
-              if (error.errorNum !== 1430) {
-                throw error;
-              }
-            }
-          }, 5, 1000);
-
+            },
+            5,
+            1000
+          );
         } else {
           const joinTableName = `_Join:${fieldName}:${className}`;
           const createJoinSql = `
@@ -1533,16 +1723,20 @@ export class OracleStorageAdapter implements StorageAdapter {
         `;
 
           await ddlQueue.enqueue(joinTableName, async () => {
-            await retryOnLock(async () => {
-              try {
-                await connection.execute(createJoinSql);
-              } catch (error) {
-                // ORA-00955: name is already used by an existing object
-                if (error.errorNum !== 955) {
-                  throw error;
+            await retryOnLock(
+              async () => {
+                try {
+                  await connection.execute(createJoinSql);
+                } catch (error) {
+                  // ORA-00955: name is already used by an existing object
+                  if (error.errorNum !== 955) {
+                    throw error;
+                  }
                 }
-              }
-            }, 5, 1000);
+              },
+              5,
+              1000
+            );
           });
         }
 
@@ -1587,7 +1781,6 @@ export class OracleStorageAdapter implements StorageAdapter {
           await connection.commit();
         }
         this._notifySchemaChange();
-
       } catch (error) {
         if (shouldCloseConnection) {
           await connection.rollback();
@@ -1816,10 +2009,9 @@ export class OracleStorageAdapter implements StorageAdapter {
       return result.rows.map(row =>
         toParseSchema({
           className: row.className,
-          ...row.schema
+          ...row.schema,
         })
       );
-
     } catch (error) {
       if (error.errorNum === 942) {
         return [];
@@ -1835,9 +2027,12 @@ export class OracleStorageAdapter implements StorageAdapter {
   // undefined as the reason.
   async getClass(className: string) {
     debug('getClass');
-    return this._client
-      .any('SELECT * FROM "_SCHEMA" WHERE "className" = $<className>', {
-        className,
+    await this._pgp;
+    const connection = await this._client.getConnection();
+
+    return connection
+      .execute(`SELECT * FROM "_SCHEMA" WHERE "className" = :className`, {
+        className: className,
       })
       .then(result => {
         if (result.length !== 1) {
@@ -1845,7 +2040,8 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
         return result[0].schema;
       })
-      .then(toParseSchema);
+      .then(toParseSchema)
+      .then(() => connection.close());
   }
 
   // TODO: remove the mongo format dependency in the return value
@@ -1946,7 +2142,6 @@ export class OracleStorageAdapter implements StorageAdapter {
     const allColumns = [...columnsArray, ...Object.keys(geoPoints)];
     const binds = {};
 
-
     columnsArray.forEach((col, index) => {
       const bindName = `val${index}`;
       if (['Array', 'Bytes', 'Object'].includes(schema.fields[col].type)) {
@@ -1965,10 +2160,10 @@ export class OracleStorageAdapter implements StorageAdapter {
     const columnsList = allColumns.map(col => `"${col}"`).join(', ');
 
     const valuesList = [
-      ...columnsArray.map((col, i) => (schema.fields[col].type === 'Date') ?
-        `TO_TIMESTAMP(:val${i}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`
-        :
-        `:val${i}`
+      ...columnsArray.map((col, i) =>
+        schema.fields[col].type === 'Date'
+          ? `TO_TIMESTAMP(:val${i}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`
+          : `:val${i}`
       ),
       ...Object.keys(geoPoints).map(
         (key, i) =>
@@ -2337,7 +2532,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     update: any,
     transactionalSession: ?any
   ) {
-    await this._pgp
+    await this._pgp;
     debug('upsertOneObject');
     const createValue = Object.assign({}, query, update);
     return this.createObject(className, schema, createValue, transactionalSession).catch(error => {
@@ -2355,7 +2550,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     const { skip, limit, sort, keys, caseInsensitive, explain } = options;
     const where = buildWhereClause({ schema, query, caseInsensitive });
     const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
-    
+
     let sortPattern = '';
     if (sort && Object.keys(sort).length > 0) {
       const sorting = Object.keys(sort)
@@ -2407,13 +2602,13 @@ export class OracleStorageAdapter implements StorageAdapter {
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
-
       if (explain) {
         return result.rows;
       }
 
-      const mappedResults = result.rows.map(obj => this.oracleObjectToParseObject(className, obj, schema));
-      
+      const mappedResults = result.rows.map(obj =>
+        this.oracleObjectToParseObject(className, obj, schema)
+      );
 
       return mappedResults;
     } catch (error) {
@@ -2516,7 +2711,10 @@ export class OracleStorageAdapter implements StorageAdapter {
         };
       }
       // Parse JSON strings for permission fields
-      if ((fieldName === '_rperm' || fieldName === '_wperm') && typeof object[fieldName] === 'string') {
+      if (
+        (fieldName === '_rperm' || fieldName === '_wperm') &&
+        typeof object[fieldName] === 'string'
+      ) {
         try {
           object[fieldName] = JSON.parse(object[fieldName]);
         } catch (e) {
@@ -2544,12 +2742,12 @@ export class OracleStorageAdapter implements StorageAdapter {
       const checkSql = `
       SELECT COUNT(*) as cnt
       FROM user_indexes
-      WHERE index_name = :indexName
+      WHERE UPPER(index_name) = UPPER(:indexName)
     `;
 
       const checkResult = await connection.execute(
         checkSql,
-        { indexName: constraintName.toUpperCase() },
+        { indexName: constraintName },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
@@ -2559,12 +2757,22 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
 
       const columnsList = fieldNames.map(field => `"${field}"`).join(', ');
-      const createIndexSql = `CREATE UNIQUE INDEX IF NOT EXISTS "${constraintName}" ON "${className}" (${columnsList})`;
+      const createIndexSql = `CREATE UNIQUE INDEX "${constraintName}" ON "${className}" (${columnsList})`;
 
-      await connection.execute(createIndexSql);
-      await connection.commit();
-
-      debug(`Created unique index: ${constraintName}`);
+      try {
+        await connection.execute(createIndexSql);
+        await connection.commit();
+        debug(`Created unique index: ${constraintName}`);
+      } catch (createError) {
+        // ORA-00955: name is already used by an existing object
+        // This can happen in race conditions where the index was created between our check and creation
+        if (createError.errorNum === 955) {
+          debug(`Index ${constraintName} already exists (race condition)`);
+          await connection.commit();
+          return;
+        }
+        throw createError;
+      }
     } catch (error) {
       await connection.rollback();
 
@@ -2686,7 +2894,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       return results.map(object => this.oracleObjectToParseObject(className, object, schema));
     } catch (error) {
       if (error.errorNum === 904) {
-        return []
+        return [];
       }
       throw error;
     } finally {
@@ -2955,11 +3163,10 @@ export class OracleStorageAdapter implements StorageAdapter {
     promises.push(this._installOracleFunctions());
 
     const start = Date.now();
-    await Promise.all(promises)
-      .catch(error => {
-        /* eslint-disable no-console */
-        console.error(error);
-      });
+    await Promise.all(promises).catch(error => {
+      /* eslint-disable no-console */
+      console.error(error);
+    });
 
     debug(`initializationDone in ${Date.now() - start}`);
   }
@@ -3108,14 +3315,19 @@ export class OracleStorageAdapter implements StorageAdapter {
     let connection;
     try {
       const sql = `
-      SELECT 
-        index_name as "indexname",
-        table_name as "tablename",
-        uniqueness as "unique",
-        column_name as "columnname"
-      FROM user_ind_columns
-      WHERE table_name = :tableName
-      ORDER BY index_name, column_position
+          SELECT 
+              i.index_name as "indexname",
+              i.table_name as "tablename",
+              c.column_name as "columnname",
+              i.uniqueness as "unique",
+              e.column_expression as "expression"
+          FROM user_ind_columns c
+                   LEFT JOIN user_indexes i
+                        ON i.index_name = c.index_name
+                   LEFT JOIN user_ind_expressions e
+                        ON e.index_name = i.index_name
+          WHERE i.table_name = :tableName
+          ORDER BY i.index_name, c.column_position
     `;
 
       await this._pgp;
@@ -3123,7 +3335,7 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       const result = await connection.execute(
         sql,
-        { tableName: className.toUpperCase() },
+        { tableName: className },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 

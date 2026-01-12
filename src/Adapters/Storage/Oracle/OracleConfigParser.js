@@ -17,24 +17,24 @@ function getDatabaseOptionsFromURI(uri) {
   databaseOptions.fallback_application_name = queryParams.fallback_application_name;
 
   if (queryParams.poolSize) {
-    databaseOptions.poolMax = parseInt(queryParams.poolSize) || 10;
+    databaseOptions.poolMax = parseInt(queryParams.poolSize) || 20;
   } else {
-    databaseOptions.poolMax = 10;
+    databaseOptions.poolMax = 20;
   }
   if (queryParams.max) {
-    databaseOptions.poolMax = parseInt(queryParams.max) || 10;
+    databaseOptions.poolMax = parseInt(queryParams.max) || 20;
   }
 
   if (queryParams.min) {
-    databaseOptions.poolMin = parseInt(queryParams.min) || 4;
+    databaseOptions.poolMin = parseInt(queryParams.min) || 5;
   } else {
-    databaseOptions.poolMin = 4;
+    databaseOptions.poolMin = 2;
   }
 
   if (queryParams.increment) {
-    databaseOptions.poolIncrement = parseInt(queryParams.increment) || 1;
+    databaseOptions.poolIncrement = parseInt(queryParams.increment) || 2;
   } else {
-    databaseOptions.poolIncrement = 1;
+    databaseOptions.poolIncrement = 2;
   }
 
   if (queryParams.timeout) {

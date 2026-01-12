@@ -37,5 +37,11 @@ export function createClient(uri, databaseOptions) {
     }
   }
 
-  return { pool, orcl };
+  const connectOptions = {
+    user: dbOptions.user,
+    password: dbOptions.password,
+    connectString: dbOptions.connectString,
+  };
+
+  return { pool, orcl, connectOptions };
 }

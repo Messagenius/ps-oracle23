@@ -23,7 +23,7 @@ const GameScore = Parse.Object.extend({
   className: 'GameScore',
 });
 
-describe_only_db('postgres')('Postgres database init options', () => {
+describe_only_dbs(['postgres'])('Postgres database init options', () => {
   it('should create server with public schema databaseOptions', async () => {
     const adapter = new PostgresStorageAdapter({
       uri: postgresURI,

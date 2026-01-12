@@ -1367,7 +1367,7 @@ class DatabaseController {
                     })
                   )
                   .catch(error => {
-                    throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, error);
+                    throw new Parse.Error(error.code, error);
                   });
               }
             });

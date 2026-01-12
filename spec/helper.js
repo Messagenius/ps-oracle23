@@ -611,6 +611,16 @@ global.describe_only_db = db => {
   }
 };
 
+global.describe_only_dbs = dbs => {
+  if (dbs.includes(process.env.PARSE_SERVER_TEST_DB)) {
+    return describe;
+  } else if (!process.env.PARSE_SERVER_TEST_DB && db == 'mongo') {
+    return describe;
+  } else {
+    return xdescribe;
+  }
+};
+
 global.fdescribe_only_db = db => {
   if (process.env.PARSE_SERVER_TEST_DB == db) {
     return fdescribe;
