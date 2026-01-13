@@ -362,11 +362,11 @@ interface WhereClause {
   sorts: Array<string>;
 }
 
-const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
+const buildWhereClause = ({ schema, query, caseInsensitive, startBindIndex = 0, className = null }): WhereClause => {
   const patterns = [];
   const binds = {};
   const sorts = [];
-  let bindIndex = 0;
+  let bindIndex = startBindIndex;
 
   const getBindName = (prefix = 'p') => {
     return `${prefix}${bindIndex++}`;
@@ -380,8 +380,11 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
     const initialPatternsLength = patterns.length;
     const fieldValue = query[fieldName];
 
+    // objectId is always a valid field, even if not in schema
+    const isObjectId = fieldName === 'objectId';
+    
     // nothing in the schema, it's gonna blow up
-    if (!schema.fields[fieldName]) {
+    if (!schema.fields[fieldName] && !isObjectId) {
       // as it won't exist
       if (fieldValue && fieldValue.$exists === false) {
         continue;
@@ -438,17 +441,35 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       binds[valueParam] = fieldValue;
     } else if (['$or', '$nor', '$and'].includes(fieldName)) {
       const clauses = [];
+      let currentBindIndex = bindIndex;
       fieldValue.forEach(subQuery => {
         const clause = buildWhereClause({
           schema,
           query: subQuery,
           caseInsensitive,
+          startBindIndex: currentBindIndex,
         });
         if (clause.pattern.length > 0) {
           clauses.push(clause.pattern);
-          Object.assign(binds, clause.binds);
+          // Merge binds from recursive call
+          for (const key in clause.binds) {
+            binds[key] = clause.binds[key];
+          }
+          // Update currentBindIndex to account for the binds used in this clause
+          const bindKeys = Object.keys(clause.binds);
+          if (bindKeys.length > 0) {
+            const bindNumbers = bindKeys.map(k => {
+              const match = k.match(/^[a-z]+(\d+)$/);
+              return match ? parseInt(match[1]) : -1;
+            }).filter(n => n >= 0);
+            if (bindNumbers.length > 0) {
+              const maxBindNum = Math.max(...bindNumbers);
+              currentBindIndex = Math.max(currentBindIndex, maxBindNum + 1);
+            }
+          }
         }
       });
+      bindIndex = currentBindIndex;
 
       const orOrAnd = fieldName === '$and' ? ' AND ' : ' OR ';
       const not = fieldName === '$nor' ? ' NOT ' : '';
@@ -535,23 +556,40 @@ const buildWhereClause = ({ schema, query, caseInsensitive }): WhereClause => {
       schema.fields[fieldName].contents &&
       schema.fields[fieldName].contents.type === 'String'
     ) {
+      // For array fields with $in, we need to check if the array contains any of the values
+      // Use JSON_TABLE to check if any array element matches the value
       const inPatterns = [];
       let allowNull = false;
 
-      fieldValue.$in.forEach(listElem => {
+      fieldValue.$in.forEach((listElem, index) => {
         if (listElem === null) {
           allowNull = true;
         } else {
-          const valueParam = getBindName('val');
-          binds[valueParam] = listElem;
-          inPatterns.push(`:${valueParam}`);
+          // Since array_contains function is invalid and JSON_TABLE in subqueries doesn't work,
+          // use a simpler approach: check if the JSON array string contains the value as a substring
+          // This is a workaround - it's not perfect but should work for simple string values
+          // We check if the JSON array contains the value by looking for it in the string representation
+          // Format: ["value"] - we need to match the value within the array
+          // Escape special characters in the value for SQL LIKE patterns
+          // For SQL LIKE, we need to escape: % _ and single quotes
+          // Note: We don't create bind variables since we're embedding the value directly in the SQL
+          const sqlEscapedValue = String(listElem)
+            .replace(/\\/g, '\\\\')  // Escape backslashes first
+            .replace(/'/g, "''")     // Escape single quotes for SQL (double them)
+            .replace(/%/g, '\\%')    // Escape % for LIKE
+            .replace(/_/g, '\\_');   // Escape _ for LIKE
+          // Use LIKE to check if the JSON array contains the value
+          // This checks if the array contains the value as a JSON string element
+          // Pattern: ["value"] or [...,"value",...] or ["value",...] or [...,"value"]
+          // We use ESCAPE '\' to handle the escaped characters
+          inPatterns.push(`("${fieldName}" IS NOT NULL AND "${fieldName}" LIKE '%"${sqlEscapedValue}"%' ESCAPE '\\')`);
         }
       });
 
       if (allowNull) {
-        patterns.push(`("${fieldName}" IS NULL OR "${fieldName}" IN (${inPatterns.join(',')}))`);
+        patterns.push(`("${fieldName}" IS NULL OR ${inPatterns.join(' OR ')})`);
       } else {
-        patterns.push(`"${fieldName}" IN (${inPatterns.join(',')})`);
+        patterns.push(`(${inPatterns.join(' OR ')})`);
       }
     } else if (isInOrNin) {
       const createConstraint = (baseArray, notIn) => {
@@ -1715,7 +1753,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         } else {
           const joinTableName = `_Join:${fieldName}:${className}`;
           const createJoinSql = `
-          CREATE TABLE "${joinTableName}" (
+          CREATE TABLE IF NOT EXISTS "${joinTableName}" (
             "relatedId" VARCHAR2(120),
             "owningId" VARCHAR2(120),
             PRIMARY KEY ("relatedId", "owningId")
@@ -1729,6 +1767,7 @@ export class OracleStorageAdapter implements StorageAdapter {
                   await connection.execute(createJoinSql);
                 } catch (error) {
                   // ORA-00955: name is already used by an existing object
+                  // Oracle 23c IF NOT EXISTS should prevent this, but keep for compatibility
                   if (error.errorNum !== 955) {
                     throw error;
                   }
@@ -1740,6 +1779,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           });
         }
 
+        // Check if field already exists in schema - if so, skip adding it (IF NOT EXISTS behavior)
         const checkSql = `
         SELECT "schema"
         FROM "_SCHEMA"
@@ -1754,7 +1794,12 @@ export class OracleStorageAdapter implements StorageAdapter {
         );
 
         if (checkResult.rows.length > 0) {
-          throw new Error('Attempted to add a field that already exists');
+          // Field already exists in schema - skip adding it (IF NOT EXISTS behavior)
+          debug(`Field ${fieldName} already exists in schema for class ${className}, skipping`);
+          if (shouldCloseConnection) {
+            await connection.commit();
+          }
+          return;
         }
 
         const updateSql = `
@@ -2116,6 +2161,9 @@ export class OracleStorageAdapter implements StorageAdapter {
           valuesArray.push(JSON.stringify(object[fieldName]));
           break;
         case 'Object':
+          // Stringify Object types for Oracle JSON columns
+          valuesArray.push(JSON.stringify(object[fieldName]));
+          break;
         case 'Bytes':
         case 'String':
         case 'Number':
@@ -2282,7 +2330,12 @@ export class OracleStorageAdapter implements StorageAdapter {
   ): Promise<any> {
     debug('findOneAndUpdate');
     return this.updateObjectsByQuery(className, schema, query, update, transactionalSession).then(
-      val => val[0]
+      val => {
+        if (!val || val.length === 0 || !val[0]) {
+          throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
+        }
+        return val[0];
+      }
     );
   }
 
@@ -2470,8 +2523,22 @@ export class OracleStorageAdapter implements StorageAdapter {
         typeof fieldValue === 'boolean'
       ) {
         const bindName = getBindName();
-        binds[bindName] = fieldValue;
-        updatePatterns.push(`"${fieldName}" = :${bindName}`);
+        // Check if this is a date field (updatedAt, createdAt) or if the schema indicates it's a Date type
+        const isDateField = (fieldName === 'updatedAt' || fieldName === 'createdAt') ||
+                            (schema.fields[fieldName] && schema.fields[fieldName].type === 'Date');
+        // Check if the string looks like an ISO 8601 date string
+        const isISODateString = typeof fieldValue === 'string' && 
+                                /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z?$/.test(fieldValue);
+        
+        if (isDateField && isISODateString) {
+          binds[bindName] = fieldValue;
+          updatePatterns.push(
+            `"${fieldName}" = TO_TIMESTAMP(:${bindName}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`
+          );
+        } else {
+          binds[bindName] = fieldValue;
+          updatePatterns.push(`"${fieldName}" = :${bindName}`);
+        }
       } else {
         debug('Not supported update', { fieldName, fieldValue });
         throw new Parse.Error(
@@ -2481,15 +2548,62 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
     }
 
+    // Ensure we're passing the correct bindIndex
+    if (bindIndex === undefined || bindIndex === null) {
+      throw new Parse.Error(
+        Parse.Error.INTERNAL_SERVER_ERROR,
+        `Invalid bindIndex: ${bindIndex}`
+      );
+    }
+    
+    
     const where = buildWhereClause({
       schema,
       query,
       caseInsensitive: false,
+      startBindIndex: bindIndex,
+      className: className,
     });
 
-    Object.assign(binds, where.binds);
+    // Debug: Log before merging - use console.error to ensure it's visible
+    const debugMsg = `Before merging WHERE binds - UPDATE bindIndex: ${bindIndex}, UPDATE binds: [${Object.keys(binds).join(', ')}], WHERE binds: [${Object.keys(where.binds).join(', ')}], WHERE pattern: ${where.pattern}`;
+    debug(debugMsg);
+    
+    // Verify that WHERE clause bind names don't conflict with UPDATE bind names
+    const conflictingBinds = Object.keys(where.binds).filter(key => binds[key] !== undefined);
+    if (conflictingBinds.length > 0) {
+      const errorMsg = `Bind name conflict detected: ${conflictingBinds.join(', ')}. UPDATE binds: [${Object.keys(binds).join(', ')}], WHERE binds: [${Object.keys(where.binds).join(', ')}], bindIndex: ${bindIndex}`;
+      console.error('OracleStorageAdapter ERROR:', errorMsg);
+      throw new Parse.Error(
+        Parse.Error.INTERNAL_SERVER_ERROR,
+        errorMsg
+      );
+    }
+
+    // Merge WHERE clause binds - ensure no conflicts
+    for (const key in where.binds) {
+      if (binds[key] !== undefined) {
+        // This should not happen if bind indices are managed correctly
+        debug(`Warning: bind name conflict detected: ${key}. UPDATE binds:`, Object.keys(binds), 'WHERE binds:', Object.keys(where.binds));
+        throw new Parse.Error(
+          Parse.Error.INTERNAL_SERVER_ERROR,
+          `Bind name conflict: ${key} already exists in UPDATE binds`
+        );
+      }
+      binds[key] = where.binds[key];
+    }
+    
+    debug('After merging - All binds:', Object.keys(binds), 'bindIndex:', bindIndex, 'WHERE pattern:', where.pattern);
 
     const whereClause = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
+
+    // Validate that we have a WHERE clause - updating without a WHERE clause would update all rows
+    if (whereClause === '') {
+      throw new Parse.Error(
+        Parse.Error.INVALID_QUERY,
+        'Cannot update without a WHERE clause'
+      );
+    }
 
     await this._pgp;
     const connection = transactionalSession || (await this._client.getConnection());
@@ -2497,26 +2611,359 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     try {
       const selectSql = `SELECT * FROM "${className}" ${whereClause}`;
+      
+      // Extract only the bind variables actually used in the SELECT SQL
+      // Oracle may be strict about only passing bind variables that are referenced in the SQL
+      // Extract bind variables while ignoring those inside string literals
+      const extractBindVariables = (sql) => {
+        const bindVars = [];
+        let inString = false;
+        let stringChar = null;
+        for (let i = 0; i < sql.length; i++) {
+          const char = sql[i];
+          const prevChar = i > 0 ? sql[i - 1] : null;
+          
+          // Check if we're entering or leaving a string literal
+          if ((char === "'" || char === '"') && prevChar !== '\\') {
+            if (!inString) {
+              inString = true;
+              stringChar = char;
+            } else if (char === stringChar) {
+              inString = false;
+              stringChar = null;
+            }
+            continue;
+          }
+          
+          // Only look for bind variables outside of string literals
+          if (!inString && char === ':') {
+            let bindName = '';
+            let j = i + 1;
+            while (j < sql.length && /[a-zA-Z0-9_]/.test(sql[j])) {
+              bindName += sql[j];
+              j++;
+            }
+            if (bindName) {
+              bindVars.push(bindName);
+            }
+          }
+        }
+        return [...new Set(bindVars)]; // Deduplicate
+      };
+      
+      const selectBindNames = extractBindVariables(selectSql);
+      const selectBinds = {};
+      const missingBinds = [];
+      for (const bindName of selectBindNames) {
+        if (binds[bindName] === undefined) {
+          missingBinds.push(bindName);
+        } else {
+          selectBinds[bindName] = binds[bindName];
+        }
+      }
+      if (missingBinds.length > 0) {
+        const errorMsg = `Missing bind variable(s) in SELECT: ${missingBinds.join(', ')}. Available binds: ${Object.keys(binds).join(', ')}. WHERE clause: ${whereClause}. SELECT SQL: ${selectSql}. UPDATE patterns: ${updatePatterns.join(', ')}`;
+        console.error('OracleStorageAdapter ERROR:', errorMsg);
+        debug(errorMsg);
+        throw new Parse.Error(
+          Parse.Error.INTERNAL_SERVER_ERROR,
+          errorMsg
+        );
+      }
+      
+      
+      // First, verify the object exists before attempting update
+      let preCheckResult;
+      try {
+        preCheckResult = await connection.execute(selectSql, selectBinds, {
+          outFormat: oracledb.OUT_FORMAT_OBJECT,
+        });
+      } catch (selectError) {
+        // ORA-06575: Package or function is in an invalid state
+        // Try to recompile the array_contains function and retry
+        const isInvalidStateError = selectError.errorNum === 6575 || 
+                                   (selectError.message && selectError.message.includes('ORA-06575')) ||
+                                   (selectError.code === 'ORA-06575');
+        if (isInvalidStateError && selectSql.includes('array_contains')) {
+          debug('array_contains function is invalid, attempting to drop and recreate...');
+          try {
+            // Try to drop the function first, ignore if it doesn't exist
+            try {
+              await connection.execute('DROP FUNCTION array_contains');
+            } catch (dropError) {
+              // Ignore errors if function doesn't exist (ORA-04043: object does not exist)
+              if (dropError.errorNum !== 4043) {
+                debug('Drop function error (may be ignored):', dropError.message);
+              }
+            }
+            // Now create it fresh
+            await connection.execute(sql.array.contains);
+            await connection.commit();
+            debug('array_contains function recreated successfully, retrying query...');
+            // Retry the query after recreating
+            preCheckResult = await connection.execute(selectSql, selectBinds, {
+              outFormat: oracledb.OUT_FORMAT_OBJECT,
+            });
+          } catch (recompileError) {
+            debug('Failed to recreate array_contains function:', recompileError.message);
+            throw selectError; // Throw the original error
+          }
+        } else {
+          throw selectError;
+        }
+      }
+      
+      if (preCheckResult.rows.length === 0) {
+        // Object doesn't exist - try to find it without _wperm condition to debug
+        const objectIdValue = query.objectId || (query.$and && query.$and[0] && query.$and[0].objectId);
+        if (objectIdValue) {
+          const debugSql = `SELECT * FROM "${className}" WHERE "objectId" = :objId`;
+          const debugResult = await connection.execute(debugSql, { objId: objectIdValue }, {
+            outFormat: oracledb.OUT_FORMAT_OBJECT,
+          });
+          
+          // Test JSON_TABLE query to see if it works
+          if (debugResult.rows.length > 0 && debugResult.rows[0]._wperm) {
+            const testValue = objectIdValue; // Use the actual objectId
+            const testSql = `SELECT COUNT(*) as cnt FROM JSON_TABLE(:wperm, '$[*]' COLUMNS (value VARCHAR2(4000) PATH '$')) WHERE CAST(value AS VARCHAR2(4000)) = CAST(:testVal AS VARCHAR2(4000))`;
+            try {
+              const testResult = await connection.execute(testSql, { 
+                wperm: debugResult.rows[0]._wperm, 
+                testVal: testValue 
+              }, {
+                outFormat: oracledb.OUT_FORMAT_OBJECT,
+              });
+              
+              // Test JSON_EXISTS directly
+              const testJsonExistsSql = `SELECT COUNT(*) as cnt FROM "_User" WHERE "objectId" = :objId AND JSON_EXISTS("_wperm", '$[*]?(@ == :testVal)')`;
+              try {
+                const testJsonExistsResult = await connection.execute(testJsonExistsSql, { 
+                  objId: objectIdValue,
+                  testVal: testValue 
+                }, {
+                  outFormat: oracledb.OUT_FORMAT_OBJECT,
+                });
+              } catch (jsonExistsError) {
+                // Ignore test errors
+              }
+              
+              // Test scalar subquery with COUNT (same as what we use in WHERE clause)
+              const testScalarSubquerySql = `SELECT COUNT(*) as cnt FROM "_User" WHERE "objectId" = :objId AND (SELECT COUNT(*) FROM JSON_TABLE("_wperm", '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt WHERE jt.val = :testVal) > 0`;
+              try {
+                const testScalarResult = await connection.execute(testScalarSubquerySql, { 
+                  objId: objectIdValue,
+                  testVal: testValue 
+                }, {
+                  outFormat: oracledb.OUT_FORMAT_OBJECT,
+                });
+              } catch (scalarError) {
+                // Ignore test errors
+              }
+              
+              // Test using table alias in the subquery
+              const testTableAliasSql = `SELECT COUNT(*) as cnt FROM "_User" u WHERE u."objectId" = :objId AND (SELECT COUNT(*) FROM JSON_TABLE(u."_wperm", '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt WHERE jt.val = :testVal) > 0`;
+              try {
+                const testTableAliasResult = await connection.execute(testTableAliasSql, { 
+                  objId: objectIdValue,
+                  testVal: testValue 
+                }, {
+                  outFormat: oracledb.OUT_FORMAT_OBJECT,
+                });
+              } catch (tableAliasError) {
+                // Ignore test errors
+              }
+            } catch (testError) {
+              // Ignore test errors
+            }
+          }
+        }
+        
+        // Object doesn't exist
+        if (shouldCloseConnection) {
+          await connection.rollback();
+        }
+        throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
+      }
 
       if (updatePatterns.length > 0) {
         const updateSql = `UPDATE "${className}" SET ${updatePatterns.join(', ')} ${whereClause}`;
-        await connection.execute(updateSql, binds);
+        
+        
+        // Helper function to recompile array_contains if needed
+        const recompileArrayContainsIfNeeded = async (error, sqlText) => {
+          const isInvalidStateError = error.errorNum === 6575 || 
+                                     (error.message && error.message.includes('ORA-06575')) ||
+                                     (error.code === 'ORA-06575') ||
+                                     (error.message && error.message.includes('ARRAY_CONTAINS') && error.message.includes('invalid state'));
+          if (isInvalidStateError && sqlText.includes('array_contains')) {
+            debug('array_contains function is invalid, attempting to drop and recreate...');
+            try {
+              // Try to drop the function first, ignore if it doesn't exist
+              try {
+                await connection.execute('DROP FUNCTION array_contains');
+              } catch (dropError) {
+                // Ignore errors if function doesn't exist
+                debug('Drop function error (ignored):', dropError.message);
+              }
+              // Now create it fresh
+              await connection.execute(sql.array.contains);
+              await connection.commit();
+              debug('array_contains function recreated successfully');
+              return true;
+            } catch (recompileError) {
+              debug('Failed to recreate array_contains function:', recompileError.message);
+              return false;
+            }
+          }
+          return false;
+        };
+        
+        // Verify all bind variables in the UPDATE SQL exist in binds
+        // Extract bind variables while ignoring those inside string literals
+        const extractBindVariables = (sql) => {
+          const bindVars = [];
+          let inString = false;
+          let stringChar = null;
+          for (let i = 0; i < sql.length; i++) {
+            const char = sql[i];
+            const prevChar = i > 0 ? sql[i - 1] : null;
+            
+            // Check if we're entering or leaving a string literal
+            if ((char === "'" || char === '"') && prevChar !== '\\') {
+              if (!inString) {
+                inString = true;
+                stringChar = char;
+              } else if (char === stringChar) {
+                inString = false;
+                stringChar = null;
+              }
+              continue;
+            }
+            
+            // Only look for bind variables outside of string literals
+            if (!inString && char === ':') {
+              let bindName = '';
+              let j = i + 1;
+              while (j < sql.length && /[a-zA-Z0-9_]/.test(sql[j])) {
+                bindName += sql[j];
+                j++;
+              }
+              if (bindName) {
+                bindVars.push(bindName);
+              }
+            }
+          }
+          return [...new Set(bindVars)]; // Deduplicate
+        };
+        
+        const updateBindNames = extractBindVariables(updateSql);
+        const missingBinds = [];
+        for (const bindName of updateBindNames) {
+          if (binds[bindName] === undefined) {
+            missingBinds.push(bindName);
+          }
+        }
+        if (missingBinds.length > 0) {
+          const errorMsg = `Missing bind variable(s) in UPDATE: ${missingBinds.join(', ')}. Available binds: ${Object.keys(binds).join(', ')}. UPDATE SQL: ${updateSql}`;
+          console.error('OracleStorageAdapter ERROR:', errorMsg);
+          throw new Parse.Error(
+            Parse.Error.INTERNAL_SERVER_ERROR,
+            errorMsg
+          );
+        }
+        
+        try {
+          await connection.execute(updateSql, binds);
+        } catch (updateError) {
+          // Try to recompile array_contains if it's invalid
+          const recompiled = await recompileArrayContainsIfNeeded(updateError, updateSql);
+          if (recompiled) {
+            // Retry the UPDATE after recompiling
+            try {
+              await connection.execute(updateSql, binds);
+            } catch (retryError) {
+              throw retryError;
+            }
+          } else {
+            throw updateError;
+          }
+        }
       }
 
-      const updatedResult = await connection.execute(selectSql, binds, {
+      // Fetch the updated rows using the same query
+      // Use the same filtered binds for the SELECT
+      
+      const updatedResult = await connection.execute(selectSql, selectBinds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
+
+      // If no rows found after update (shouldn't happen since we checked before, but be safe)
+      if (updatedResult.rows.length === 0) {
+        if (shouldCloseConnection) {
+          await connection.rollback();
+        }
+        throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
+      }
 
       if (shouldCloseConnection) {
         await connection.commit();
       }
 
-      return updatedResult.rows;
+      // Convert Oracle rows to Parse objects
+      const mappedResults = updatedResult.rows.map(obj => {
+        try {
+          return this.oracleObjectToParseObject(className, obj, schema);
+        } catch (error) {
+          debug('Error converting Oracle object to Parse object:', error);
+          throw error;
+        }
+      });
+
+      // Filter out any undefined/null results (shouldn't happen, but be safe)
+      const validResults = mappedResults.filter(result => result != null);
+      if (validResults.length === 0) {
+        if (shouldCloseConnection) {
+          await connection.rollback();
+        }
+        throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found after conversion.');
+      }
+
+      return validResults;
     } catch (error) {
       if (shouldCloseConnection) {
         await connection.rollback();
       }
-      throw error;
+      
+      // If it's already a Parse.Error, re-throw it
+      if (error instanceof Parse.Error) {
+        throw error;
+      }
+      
+      // Handle Oracle-specific errors
+      if (error.errorNum) {
+        // ORA-00001: unique constraint violated
+        if (error.errorNum === 1) {
+          const err = new Parse.Error(
+            Parse.Error.DUPLICATE_VALUE,
+            'A duplicate value for a field with unique values was provided'
+          );
+          err.underlyingError = error;
+          throw err;
+        }
+        // ORA-00942: table or view does not exist
+        if (error.errorNum === 942) {
+          throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
+        }
+      }
+      
+      // For other errors, wrap in INTERNAL_SERVER_ERROR with more details
+      debug('Error in updateObjectsByQuery:', error);
+      const internalError = new Parse.Error(
+        Parse.Error.INTERNAL_SERVER_ERROR,
+        error.message || 'Internal server error'
+      );
+      internalError.underlyingError = error;
+      throw internalError;
     } finally {
       if (shouldCloseConnection && connection) {
         await connection.close();
@@ -2721,6 +3168,28 @@ export class OracleStorageAdapter implements StorageAdapter {
           // If parsing fails, keep as string (fallback)
         }
       }
+      // Parse JSON strings for Array and Object types
+      if (schema.fields[fieldName]) {
+        const fieldType = schema.fields[fieldName].type;
+        if ((fieldType === 'Array' || fieldType === 'Object') && typeof object[fieldName] === 'string') {
+          try {
+            const parsed = JSON.parse(object[fieldName]);
+            object[fieldName] = parsed;
+            // Ensure Object types are not arrays after parsing
+            if (fieldType === 'Object' && Array.isArray(parsed)) {
+              // If parsed JSON is an array but should be an object, convert to empty object
+              // This handles edge cases where JSON might be malformed
+              object[fieldName] = {};
+            }
+          } catch (e) {
+            // If parsing fails, keep as string (fallback)
+          }
+        } else if (fieldType === 'Object' && Array.isArray(object[fieldName])) {
+          // If Oracle returned an array for an Object type, convert to empty object
+          // This should not happen if we stringify on insert, but handle it just in case
+          object[fieldName] = {};
+        }
+      }
     }
 
     return object;
@@ -2756,7 +3225,51 @@ export class OracleStorageAdapter implements StorageAdapter {
         return;
       }
 
+      // Check for duplicates before attempting to create the unique index
+      // ORA-01452 occurs when trying to create a unique index on columns with duplicate values
       const columnsList = fieldNames.map(field => `"${field}"`).join(', ');
+      // For multi-column unique indexes, check for duplicate combinations
+      // Use a subquery to count rows with duplicate combinations
+      // Only check non-NULL combinations since NULLs are considered distinct in Oracle unique indexes
+      const whereConditions = fieldNames.map(field => `"${field}" IS NOT NULL`).join(' AND ');
+      const checkDuplicatesSql = `
+        SELECT COUNT(*) as duplicate_count
+        FROM (
+          SELECT ${columnsList}, COUNT(*) as cnt
+          FROM "${className}"
+          ${whereConditions ? `WHERE ${whereConditions}` : ''}
+          GROUP BY ${columnsList}
+          HAVING COUNT(*) > 1
+        )
+      `;
+
+      try {
+        const duplicateCheckResult = await connection.execute(
+          checkDuplicatesSql,
+          {},
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+
+        const duplicateCount = duplicateCheckResult.rows[0].DUPLICATE_COUNT;
+
+        // If there are duplicates, we cannot create a unique index
+        if (duplicateCount > 0) {
+          debug(
+            `Cannot create unique index ${constraintName} on ${className}: ${duplicateCount} duplicate value(s) found`
+          );
+          // No commit needed - we only performed SELECT queries
+          return;
+        }
+      } catch (checkError) {
+        // ORA-00942: table or view does not exist - table might not exist yet, continue
+        if (checkError.errorNum === 942) {
+          debug(`Table ${className} does not exist, skipping duplicate check`);
+        } else {
+          // For other errors, log but continue - we'll catch ORA-01452 during index creation
+          debug(`Error checking for duplicates: ${checkError.message}`);
+        }
+      }
+
       const createIndexSql = `CREATE UNIQUE INDEX "${constraintName}" ON "${className}" (${columnsList})`;
 
       try {
@@ -2768,7 +3281,16 @@ export class OracleStorageAdapter implements StorageAdapter {
         // This can happen in race conditions where the index was created between our check and creation
         if (createError.errorNum === 955) {
           debug(`Index ${constraintName} already exists (race condition)`);
-          await connection.commit();
+          // No commit needed - index creation failed, nothing to commit
+          return;
+        }
+        // ORA-01452: cannot CREATE UNIQUE INDEX; duplicate keys found
+        // This can happen if duplicates were inserted between our check and index creation
+        if (createError.errorNum === 1452) {
+          debug(
+            `Cannot create unique index ${constraintName} on ${className}: duplicate values found. Index creation skipped.`
+          );
+          // No commit needed - index creation failed, nothing to commit
           return;
         }
         throw createError;
@@ -3198,13 +3720,14 @@ export class OracleStorageAdapter implements StorageAdapter {
         const indexName = index.name || `${className}_${index.key}_idx`;
         const columnName = index.key;
 
-        const createIndexSql = `CREATE INDEX "${indexName}" ON "${className}" ("${columnName}")`;
+        const createIndexSql = `CREATE INDEX IF NOT EXISTS "${indexName}" ON "${className}" ("${columnName}")`;
 
         try {
           await connection.execute(createIndexSql);
           debug(`Created index: ${indexName}`);
         } catch (error) {
           // ORA-00955: name is already used by an existing object
+          // Oracle 23c IF NOT EXISTS should prevent this, but keep for compatibility
           if (error.errorNum === 955) {
             debug(`Index ${indexName} already exists, skipping`);
             continue;
@@ -3242,13 +3765,14 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     try {
       const indexName = `${className}_${fieldName}_idx`;
-      const createIndexSql = `CREATE INDEX "${indexName}" ON "${className}" ("${fieldName}")`;
+      const createIndexSql = `CREATE INDEX IF NOT EXISTS "${indexName}" ON "${className}" ("${fieldName}")`;
 
       try {
         await connection.execute(createIndexSql);
         debug(`Created index: ${indexName}`);
       } catch (error) {
         // ORA-00955: name is already used by an existing object
+        // Oracle 23c IF NOT EXISTS should prevent this, but keep for compatibility
         if (error.errorNum !== 955) {
           throw error;
         }
