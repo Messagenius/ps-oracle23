@@ -495,7 +495,7 @@ export function maybeRunAfterFindTrigger(
     logTriggerAfterHook(
       triggerType,
       className,
-      JSON.stringify(results),
+      results,
       auth,
       config.logLevels.triggerAfter
     );
@@ -641,7 +641,10 @@ export function resolveError(message, defaultOpts) {
   if (typeof message === 'string') {
     return new Parse.Error(code, message);
   }
-  const error = new Parse.Error(code, message.message || message);
+  const errorMessage =
+    (typeof message.message === 'string' ? message.message : null) ||
+    (defaultOpts.message || 'Script failed.');
+  const error = new Parse.Error(code, errorMessage);
   if (message instanceof Error) {
     error.stack = message.stack;
   }

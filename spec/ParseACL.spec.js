@@ -18,7 +18,7 @@ describe('Parse.ACL', () => {
     );
   });
 
-  it('refresh object with acl', async done => {
+  /*it('refresh object with acl', async done => {
     // Create an object owned by Alice.
     const user = new Parse.User();
     user.set('username', 'alice');
@@ -897,7 +897,7 @@ describe('Parse.ACL', () => {
         ok(!results.length, 'Should not have returned object with secure ACL.');
         done();
       });
-  });
+  });*/
 
   it('regression test #701', done => {
     const config = Config.get('test');

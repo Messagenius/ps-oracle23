@@ -363,25 +363,35 @@ describe('miscellaneous', function () {
   });
 
   it('query without limit get default 100 records', function (done) {
+    console.log('TEST DEBUG: Starting test - creating 150 objects');
     const objects = [];
     for (let i = 0; i < 150; i++) {
       objects.push(new TestObject({ name: 'name' + i }));
     }
+    console.log('TEST DEBUG: Objects created, starting saveAll...');
     Parse.Object.saveAll(objects)
       .then(() => {
+        console.log('TEST DEBUG: saveAll completed, starting query...');
         return new Parse.Query(TestObject).find();
       })
       .then(
         results => {
+          console.log('TEST DEBUG: Query completed, results count:', results.length);
           expect(results.length).toEqual(100);
           done();
         },
         error => {
+          console.log('TEST DEBUG: Error occurred:', error);
           fail(JSON.stringify(error));
           done();
         }
-      );
-  });
+      )
+      .catch(error => {
+        console.log('TEST DEBUG: Unhandled error:', error);
+        fail(JSON.stringify(error));
+        done();
+      });
+  }, 3600000); // 1 hour timeout for Oracle (150 saves + query)
 
   it('basic saveAll', function (done) {
     const alpha = new TestObject({ letter: 'alpha' });

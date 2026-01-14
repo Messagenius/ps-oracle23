@@ -72,6 +72,11 @@ if (process.env.PARSE_SERVER_DATABASE_ADAPTER) {
   databaseAdapter = new OracleStorageAdapter({
     uri: databaseURI,
     collectionPrefix: 'test_',
+    databaseOptions: {
+      poolMin: 5,
+      poolMax: 50, // Increased for tests that create many objects (e.g., saveAll with 150 objects)
+      poolIncrement: 5,
+    },
   });
 } else {
   databaseURI = mongoURI;

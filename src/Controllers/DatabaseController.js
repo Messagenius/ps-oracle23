@@ -1367,7 +1367,8 @@ class DatabaseController {
                     })
                   )
                   .catch(error => {
-                    throw new Parse.Error(error.code, error);
+                    const errorMessage = typeof error === 'string' ? error : (error?.message || 'Unknown error');
+                    throw new Parse.Error(error.code || Parse.Error.INTERNAL_SERVER_ERROR, errorMessage);
                   });
               }
             });

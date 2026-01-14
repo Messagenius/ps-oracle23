@@ -282,7 +282,8 @@ const transformDotFieldToComponents = fieldName => {
     if (isArrayIndex(cmpt)) {
       return Number(cmpt);
     } else {
-      return `'${cmpt}'`;
+      // Use double quotes for JSON path keys (not single quotes)
+      return `"${cmpt}"`;
     }
   });
 };
@@ -1088,6 +1089,11 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
   }
 
+  createExplainableQuery(query: string): string {
+    const explainQuery = this._prepareExplainQuery(query, false);
+    return explainQuery.explainQuery;
+  }
+
   async explainQuery(connection: any, query: string, analyze: boolean = false): Promise<any> {
     const explainQuery = this._prepareExplainQuery(query, analyze);
 
@@ -1170,7 +1176,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
 
     try {
-      const setupConn = await this._client.getConnection();
+      const pool = await this._pgp;
+      const setupConn = await pool.getConnection();
       try {
         await setupConn.execute(`
         DECLARE
@@ -1196,7 +1203,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       this._lastKnownChange = new Date(Date.now() - 10000);
       this._isPolling = false;
 
-      this._pollingConnection = await this._client.getConnection(this._connectOptions);
+      this._pollingConnection = await pool.getConnection();
 
       // Set _stream before starting the interval to ensure _notifySchemaChange can work
       this._stream = { polling: true };
@@ -1275,7 +1282,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   async _notifySchemaChange() {
     if (!this._stream) return;
 
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       // Сначала пробуем UPDATE
@@ -1312,8 +1320,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
   }
   async _setDateFormats() {
-    await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
     await connection.execute(`
     ALTER SESSION SET NLS_DATE_FORMAT = 'DD/MM/YYYY'
   `);
@@ -1333,8 +1341,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
   async _ensureSchemaCollectionExists(conn: any) {
     const shouldCloseConnection = !conn;
-    await this._pgp;
-    conn = conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    conn = conn || (await pool.getConnection());
     await conn
       .execute(
         'CREATE TABLE IF NOT EXISTS "_SCHEMA" (\n' +
@@ -1359,8 +1367,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     FROM user_tables
     WHERE table_name = :tableName
   `;
-    await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
     const result = await connection.execute(
       sql,
       { tableName: name.toUpperCase() },
@@ -1386,8 +1394,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     let connection = null;
     try {
-      await this._pgp;
-      connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    connection = await pool.getConnection();
       const result = await connection.execute(
         sql,
         {
@@ -1422,8 +1430,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     fields: any,
     conn?: any
   ): Promise<void> {
-    await this._pgp;
-    const connection = conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = conn || (await pool.getConnection());
     const shouldCloseConnection = !conn;
 
     try {
@@ -1515,8 +1523,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
 
   async createClass(className: string, schema: SchemaType, conn?: any) {
-    await this._pgp;
-    const connection = conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = conn || (await pool.getConnection());
     const shouldCloseConnection = !conn;
 
     try {
@@ -1569,9 +1577,9 @@ export class OracleStorageAdapter implements StorageAdapter {
 
   // Just create a table, do not insert in schema
   async createTable(className: string, schema: SchemaType, conn: any) {
-    await this._pgp;
+    const pool = await this._pgp;
     const shouldCloseConnection = !conn;
-    const connection = conn || (await this._client.getConnection());
+    const connection = conn || (await pool.getConnection());
 
     debug('createTable', className);
 
@@ -1657,8 +1665,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   async schemaUpgrade(className: string, schema: SchemaType, conn: any) {
     debug('schemaUpgrade', className);
 
-    await this._pgp;
-    const connection = conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = conn || (await pool.getConnection());
     const shouldCloseConnection = !conn;
 
     try {
@@ -1701,7 +1709,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     await this._pgp;
 
     return ddlQueue.enqueue(className, async () => {
-      const connection = conn || (await this._client.getConnection());
+      const pool = await this._pgp;
+      const connection = conn || (await pool.getConnection());
       const shouldCloseConnection = !conn;
 
       try {
@@ -1841,7 +1850,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
   async updateFieldOptions(className: string, fieldName: string, type: any) {
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       const result = await connection.execute(
@@ -1874,7 +1884,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   // and resolves with false if it wasn't (eg. a join table). Rejects if deletion was impossible.
   async deleteClass(className: string) {
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       const dropTableSql = `DROP TABLE "${className}" CASCADE CONSTRAINTS`;
@@ -1917,7 +1928,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
 
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       let results;
@@ -2003,7 +2015,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     }, []);
 
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       await connection.execute(
@@ -2041,8 +2054,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   // schemas cannot be retrieved, returns a promise that rejects. Requirements for the
   // rejection reason are TBD.
   async getAllClasses() {
-    await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       const result = await connection.execute(
@@ -2072,8 +2085,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   // undefined as the reason.
   async getClass(className: string) {
     debug('getClass');
-    await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     return connection
       .execute(`SELECT * FROM "_SCHEMA" WHERE "className" = :className`, {
@@ -2100,6 +2113,7 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     const columnsArray = [];
     const valuesArray = [];
+    const dateFields = new Set(); // Track which fields are Date fields (for special _User fields not in schema)
     schema = toOracleSchema(schema);
     const geoPoints = {};
 
@@ -2124,20 +2138,20 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
       }
 
-      columnsArray.push(fieldName);
-
       if (!schema.fields[fieldName] && className === '_User') {
+        let valueAdded = false;
+        
         if (
           fieldName === '_email_verify_token' ||
           fieldName === '_failed_login_count' ||
           fieldName === '_perishable_token' ||
           fieldName === '_password_history'
         ) {
-          valuesArray.push(object[fieldName]);
+          valueAdded = true;
         }
 
         if (fieldName === '_email_verify_token_expires_at') {
-          valuesArray.push(object[fieldName] ? object[fieldName].iso : null);
+          valueAdded = true;
         }
 
         if (
@@ -2145,10 +2159,42 @@ export class OracleStorageAdapter implements StorageAdapter {
           fieldName === '_perishable_token_expires_at' ||
           fieldName === '_password_changed_at'
         ) {
-          valuesArray.push(object[fieldName] ? object[fieldName].iso : null);
+          valueAdded = true;
         }
+        
+        if (valueAdded) {
+          columnsArray.push(fieldName);
+          if (
+            fieldName === '_email_verify_token' ||
+            fieldName === '_failed_login_count' ||
+            fieldName === '_perishable_token' ||
+            fieldName === '_password_history'
+          ) {
+            valuesArray.push(object[fieldName]);
+          } else if (fieldName === '_email_verify_token_expires_at') {
+            dateFields.add(fieldName);
+            valuesArray.push(object[fieldName] ? object[fieldName].iso : null);
+          } else if (
+            fieldName === '_account_lockout_expires_at' ||
+            fieldName === '_perishable_token_expires_at' ||
+            fieldName === '_password_changed_at'
+          ) {
+            dateFields.add(fieldName);
+            valuesArray.push(object[fieldName] ? object[fieldName].iso : null);
+          }
+          return;
+        }
+        // If field doesn't match any conditions, skip it (don't add to columnsArray)
         return;
       }
+
+      // Ensure field exists in schema before processing
+      if (!schema.fields[fieldName]) {
+        // Skip fields not in schema (they should have been handled earlier)
+        return;
+      }
+
+      columnsArray.push(fieldName);
 
       switch (schema.fields[fieldName].type) {
         case 'Date':
@@ -2187,16 +2233,53 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
     });
 
+    // Validate that columnsArray and valuesArray have the same length
+    if (columnsArray.length !== valuesArray.length) {
+      const errorMsg = `Column/value mismatch in createObject: columnsArray.length=${columnsArray.length}, valuesArray.length=${valuesArray.length}. Columns: [${columnsArray.join(', ')}], className: ${className}`;
+      debug(errorMsg);
+      throw new Parse.Error(
+        Parse.Error.INTERNAL_SERVER_ERROR,
+        errorMsg
+      );
+    }
+
     const allColumns = [...columnsArray, ...Object.keys(geoPoints)];
     const binds = {};
+    const columnToBindIndex = new Map(); // Map column index to sequential bind index
+    let bindIndex = 0; // Sequential index for bind parameters
 
-    columnsArray.forEach((col, index) => {
-      const bindName = `val${index}`;
-      if (['Array', 'Bytes', 'Object'].includes(schema.fields[col].type)) {
-        binds[bindName] = JSON.stringify(valuesArray[index]);
-      } else {
-        binds[bindName] = valuesArray[index];
+    // First pass: create bind parameters and map column indices to bind indices
+    columnsArray.forEach((col, colIndex) => {
+      const value = valuesArray[colIndex];
+      const isDateField = (schema.fields[col] && schema.fields[col].type === 'Date') || dateFields.has(col);
+      
+      // Check if field is in schema or is a special _User field
+      if (!schema.fields[col] && !dateFields.has(col) && className !== '_User') {
+        const errorMsg = `Field "${col}" not found in schema for class "${className}". Available fields: [${Object.keys(schema.fields).join(', ')}]`;
+        debug(errorMsg);
+        throw new Parse.Error(
+          Parse.Error.INTERNAL_SERVER_ERROR,
+          errorMsg
+        );
       }
+      
+      // For null Date fields, use NULL directly in SQL (no bind parameter)
+      if (isDateField && (value === null || value === undefined)) {
+        columnToBindIndex.set(colIndex, null); // Mark as null (no bind)
+        return;
+      }
+      
+      // Create bind parameter with sequential index
+      const bindName = `val${bindIndex}`;
+      columnToBindIndex.set(colIndex, bindIndex);
+      
+      if (schema.fields[col] && ['Array', 'Bytes', 'Object'].includes(schema.fields[col].type)) {
+        binds[bindName] = JSON.stringify(value);
+      } else {
+        binds[bindName] = value;
+      }
+      
+      bindIndex++;
     });
 
     Object.keys(geoPoints).forEach((key, index) => {
@@ -2205,27 +2288,197 @@ export class OracleStorageAdapter implements StorageAdapter {
       binds[`geo${index}_lat`] = value.latitude;
     });
 
+    // Validate we have at least one column to insert
+    if (allColumns.length === 0) {
+      const errorMsg = `No columns to insert for class "${className}". Object keys: [${Object.keys(object).join(', ')}]`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+
     const columnsList = allColumns.map(col => `"${col}"`).join(', ');
 
-    const valuesList = [
-      ...columnsArray.map((col, i) =>
-        schema.fields[col].type === 'Date'
-          ? `TO_TIMESTAMP(:val${i}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`
-          : `:val${i}`
-      ),
-      ...Object.keys(geoPoints).map(
-        (key, i) =>
-          `SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:geo${i}_lon, :geo${i}_lat, NULL), NULL, NULL)`
-      ),
-    ].join(', ');
+    const valuesList = [];
+    for (let colIndex = 0; colIndex < columnsArray.length; colIndex++) {
+      const col = columnsArray[colIndex];
+      // Check if field is a Date field (either in schema or in dateFields set)
+      const isDateField = (schema.fields[col] && schema.fields[col].type === 'Date') || dateFields.has(col);
+      const value = valuesArray[colIndex];
+      const bindIdx = columnToBindIndex.get(colIndex);
+      
+      // For Date fields with null values, use NULL directly instead of TO_TIMESTAMP
+      if (isDateField && (bindIdx === null || bindIdx === undefined || value === null || value === undefined)) {
+        valuesList.push('NULL');
+        continue;
+      }
+      
+      // Validate bind index exists
+      if (bindIdx === null || bindIdx === undefined) {
+        const errorMsg = `No bind index found for column "${col}" at index ${colIndex}. columnsArray.length=${columnsArray.length}, valuesArray.length=${valuesArray.length}, columnToBindIndex entries: ${Array.from(columnToBindIndex.entries()).map(([k, v]) => `${k}->${v}`).join(', ')}`;
+        console.error(errorMsg);
+        throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+      }
+      
+      // Validate bind parameter exists
+      const bindName = `val${bindIdx}`;
+      if (!binds.hasOwnProperty(bindName)) {
+        const errorMsg = `Bind parameter "${bindName}" not found for column "${col}" at index ${colIndex}. Available binds: ${Object.keys(binds).sort().join(', ')}`;
+        console.error(errorMsg);
+        throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+      }
+      
+      // Use the sequential bind index
+      if (isDateField) {
+        valuesList.push(`TO_TIMESTAMP(:${bindName}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`);
+      } else {
+        valuesList.push(`:${bindName}`);
+      }
+    }
+    
+    // Add geoPoints values
+    Object.keys(geoPoints).forEach((key, i) => {
+      valuesList.push(`SDO_GEOMETRY(2001, NULL, SDO_POINT_TYPE(:geo${i}_lon, :geo${i}_lat, NULL), NULL, NULL)`);
+    });
 
-    const insertSql = `INSERT INTO "${className}" (${columnsList}) VALUES (${valuesList})`;
+    if (valuesList.length === 0) {
+      const errorMsg = `No values to insert for class "${className}". columnsArray.length=${columnsArray.length}, valuesArray.length=${valuesArray.length}`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
 
-    await this._pgp;
-    const connection = transactionalSession || (await this._client.getConnection());
+    // Validate valuesList doesn't contain undefined or null entries (should all be strings)
+    const invalidValues = valuesList.filter(v => v === undefined || v === null || typeof v !== 'string');
+    if (invalidValues.length > 0) {
+      const errorMsg = `Invalid values in valuesList for class "${className}": ${invalidValues.length} invalid entries. valuesList: [${valuesList.map((v, i) => `${i}=${typeof v}=${v}`).join(', ')}]`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+    
+    const valuesListStr = valuesList.join(', ');
+    
+    // Validate columnsList and valuesListStr are not empty
+    if (!columnsList || columnsList.trim() === '') {
+      const errorMsg = `Empty columnsList for class "${className}". allColumns: [${allColumns.join(', ')}]`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+    
+    if (!valuesListStr || valuesListStr.trim() === '') {
+      const errorMsg = `Empty valuesListStr for class "${className}". valuesList: [${valuesList.join(', ')}]`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+    
+    // Check for trailing/leading commas or double commas which would cause syntax errors
+    if (columnsList.startsWith(',') || columnsList.endsWith(',') || columnsList.includes(',,')) {
+      const errorMsg = `Malformed columnsList for class "${className}": "${columnsList}"`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+    
+    if (valuesListStr.startsWith(',') || valuesListStr.endsWith(',') || valuesListStr.includes(',,')) {
+      const errorMsg = `Malformed valuesListStr for class "${className}": "${valuesListStr}"`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+    
+    // Critical validation: ensure columns and values match
+    const columnCount = allColumns.length;
+    const valueCount = valuesList.length;
+    if (columnCount !== valueCount) {
+      const errorMsg = `Column/value count mismatch in createObject for class "${className}": ${columnCount} columns but ${valueCount} values. columnsArray.length=${columnsArray.length}, geoPoints count=${Object.keys(geoPoints).length}, valuesList.length=${valuesList.length}`;
+      console.error(errorMsg);
+      console.error(`columnsList: "${columnsList}"`);
+      console.error(`valuesListStr: "${valuesListStr}"`);
+      console.error(`allColumns:`, allColumns);
+      console.error(`valuesList:`, valuesList);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+    
+    const insertSql = `INSERT INTO "${className}" (${columnsList}) VALUES (${valuesListStr})`;
+    
+    // Validate SQL syntax - check for balanced parentheses
+    // Count parentheses, but ignore those inside string literals
+    let openParens = 0;
+    let closeParens = 0;
+    let inString = false;
+    let stringChar = null;
+    for (let i = 0; i < insertSql.length; i++) {
+      const char = insertSql[i];
+      const prevChar = i > 0 ? insertSql[i - 1] : null;
+      
+      // Check if we're entering or leaving a string literal
+      if ((char === "'" || char === '"') && prevChar !== '\\') {
+        if (!inString) {
+          inString = true;
+          stringChar = char;
+        } else if (char === stringChar) {
+          inString = false;
+          stringChar = null;
+        }
+        continue;
+      }
+      
+      // Only count parentheses outside of string literals
+      if (!inString) {
+        if (char === '(') openParens++;
+        if (char === ')') closeParens++;
+      }
+    }
+    
+    if (openParens !== closeParens) {
+      const errorMsg = `Unbalanced parentheses in SQL for class "${className}": ${openParens} open, ${closeParens} close. SQL: ${insertSql}`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+    
+    // Additional validation: check for common SQL syntax issues
+    if (insertSql.includes('()') || insertSql.includes('( )')) {
+      const errorMsg = `Empty parentheses detected in SQL for class "${className}". SQL: ${insertSql}`;
+      console.error(errorMsg);
+      throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
+    }
+
+    // Always log SQL for _User class to help debug
+    if (className === '_User') {
+      console.log(`[DEBUG] createObject SQL for _User:`);
+      console.log(`  SQL: ${insertSql}`);
+      console.log(`  Columns (${columnCount}):`, allColumns);
+      console.log(`  Values (${valueCount}):`, valuesList);
+      console.log(`  Binds:`, Object.keys(binds).sort().map(k => `${k}=${typeof binds[k]}`));
+    }
+
+    // Debug logging to help diagnose issues - always log for _User class
+    if (columnsArray.length !== valuesArray.length || className === '_User') {
+      debug(`createObject SQL generation for class "${className}":`);
+      debug(`  columnsArray.length=${columnsArray.length}, valuesArray.length=${valuesArray.length}`);
+      debug(`  columnsArray:`, columnsArray);
+      debug(`  valuesArray types:`, valuesArray.map(v => typeof v));
+      debug(`  dateFields:`, Array.from(dateFields));
+      debug(`  columnToBindIndex:`, Array.from(columnToBindIndex.entries()));
+      debug(`  columnsList:`, columnsList);
+      debug(`  valuesList:`, valuesList);
+      debug(`  insertSql:`, insertSql);
+      debug(`  binds keys:`, Object.keys(binds));
+      debug(`  binds values:`, Object.values(binds).map(v => typeof v === 'string' ? v.substring(0, 50) : v));
+    }
+
+    const pool = await this._pgp;
+    const connection = transactionalSession || (await pool.getConnection());
     const shouldCloseConnection = !transactionalSession;
 
     try {
+      // Log the exact SQL and binds before execution for debugging
+      if (className === '_User') {
+        console.error(`[ERROR DEBUG] About to execute SQL for _User:`);
+        console.error(`  SQL: ${insertSql}`);
+        console.error(`  Binds count: ${Object.keys(binds).length}`);
+        console.error(`  Binds:`, JSON.stringify(Object.keys(binds).reduce((acc, k) => {
+          const val = binds[k];
+          acc[k] = typeof val === 'string' ? (val.length > 100 ? val.substring(0, 100) + '...' : val) : val;
+          return acc;
+        }, {}), null, 2));
+      }
+      
       await connection.execute(insertSql, binds);
 
       if (shouldCloseConnection) {
@@ -2236,6 +2489,35 @@ export class OracleStorageAdapter implements StorageAdapter {
     } catch (error) {
       if (shouldCloseConnection) {
         await connection.rollback();
+      }
+
+      // Enhanced error logging for SQL syntax errors
+      if (error.errorNum === 907 || (error.message && error.message.includes('ORA-00907'))) {
+        const errorDetails = {
+          className,
+          sql: insertSql,
+          columnsArray: columnsArray,
+          valuesArray: valuesArray.map(v => typeof v === 'object' ? JSON.stringify(v).substring(0, 100) : v),
+          bindsKeys: Object.keys(binds).sort(),
+          bindsValues: Object.keys(binds).sort().reduce((acc, k) => {
+            const val = binds[k];
+            acc[k] = typeof val === 'string' ? (val.length > 50 ? val.substring(0, 50) + '...' : val) : val;
+            return acc;
+          }, {}),
+          dateFields: Array.from(dateFields),
+          columnToBindIndex: Array.from(columnToBindIndex.entries()),
+          columnsList,
+          valuesList,
+          allColumns,
+          objectKeys: Object.keys(object),
+          openParens,
+          closeParens
+        };
+        console.error(`[CRITICAL] SQL syntax error (ORA-00907) in createObject:`, JSON.stringify(errorDetails, null, 2));
+        console.error(`SQL: ${insertSql}`);
+        console.error(`Columns: [${allColumns.join(', ')}]`);
+        console.error(`Values: [${valuesList.join(', ')}]`);
+        console.error(`Binds:`, binds);
       }
 
       // ORA-00001: unique constraint violated
@@ -2280,11 +2562,17 @@ export class OracleStorageAdapter implements StorageAdapter {
     const wherePattern = Object.keys(query).length === 0 ? '1=1' : where.pattern;
 
     await this._pgp;
-    const connection = transactionalSession || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = transactionalSession || (await pool.getConnection());
     const shouldCloseConnection = !transactionalSession;
 
     try {
       const selectSql = `SELECT * FROM "${className}" WHERE ${wherePattern}`;
+      console.error(`[SQL DEBUG] About to execute DELETE query for class "${className}":`);
+      console.error(`  SELECT SQL: ${selectSql}`);
+      console.error(`  DELETE SQL: DELETE FROM "${className}" WHERE ${wherePattern}`);
+      console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
+      
       const selectResult = await connection.execute(selectSql, where.binds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
@@ -2311,6 +2599,14 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       if (error.errorNum === 942) {
         return { count: 0, objects: [] };
+      }
+      
+      // Enhanced error logging for SQL syntax errors
+      if (error.errorNum === 907 || (error.message && error.message.includes('ORA-00907'))) {
+        console.error(`[CRITICAL] SQL syntax error (ORA-00907) in deleteObjectsByQuery for class "${className}":`);
+        console.error(`  SELECT SQL: SELECT * FROM "${className}" WHERE ${wherePattern}`);
+        console.error(`  DELETE SQL: DELETE FROM "${className}" WHERE ${wherePattern}`);
+        console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
       }
 
       throw error;
@@ -2606,11 +2902,16 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
 
     await this._pgp;
-    const connection = transactionalSession || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = transactionalSession || (await pool.getConnection());
     const shouldCloseConnection = !transactionalSession;
 
     try {
       const selectSql = `SELECT * FROM "${className}" ${whereClause}`;
+      
+      console.error(`[SQL DEBUG] About to execute UPDATE query for class "${className}":`);
+      console.error(`  SELECT SQL: ${selectSql}`);
+      console.error(`  Binds:`, JSON.stringify(binds || {}, null, 2));
       
       // Extract only the bind variables actually used in the SELECT SQL
       // Oracle may be strict about only passing bind variables that are referenced in the SQL
@@ -2788,6 +3089,9 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (updatePatterns.length > 0) {
         const updateSql = `UPDATE "${className}" SET ${updatePatterns.join(', ')} ${whereClause}`;
         
+        console.error(`[SQL DEBUG] About to execute UPDATE statement for class "${className}":`);
+        console.error(`  UPDATE SQL: ${updateSql}`);
+        console.error(`  Binds:`, JSON.stringify(binds || {}, null, 2));
         
         // Helper function to recompile array_contains if needed
         const recompileArrayContainsIfNeeded = async (error, sqlText) => {
@@ -2995,6 +3299,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     debug('find', className);
 
     const { skip, limit, sort, keys, caseInsensitive, explain } = options;
+    
     const where = buildWhereClause({ schema, query, caseInsensitive });
     const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
 
@@ -3039,12 +3344,18 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     const dataQuery = `SELECT ${columns} FROM "${className}" ${wherePattern} ${sortPattern} ${paginationPattern}`.trim();
 
-    await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
+      // Log SQL before execution for debugging
+      const finalQuery = explain ? this.createExplainableQuery(dataQuery) : dataQuery;
+      console.error(`[SQL DEBUG] About to execute FIND query for class "${className}":`);
+      console.error(`  SQL: ${finalQuery}`);
+      console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
+      
       const result = await connection.execute(
-        explain ? this.createExplainableQuery(dataQuery) : dataQuery,
+        finalQuery,
         where.binds || {},
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
@@ -3053,18 +3364,41 @@ export class OracleStorageAdapter implements StorageAdapter {
         return result.rows;
       }
 
-      const mappedResults = result.rows.map(obj =>
-        this.oracleObjectToParseObject(className, obj, schema)
-      );
+      const mappedResults = result.rows.map(obj => {
+        try {
+          return this.oracleObjectToParseObject(className, obj, schema);
+        } catch (conversionError) {
+          debug('Error converting Oracle object to Parse object:', conversionError);
+          throw conversionError;
+        }
+      });
 
       return mappedResults;
     } catch (error) {
       if (error.errorNum === 942) {
         return [];
       }
+      
+      // Enhanced error logging for SQL syntax errors
+      if (error.errorNum === 907 || (error.message && error.message.includes('ORA-00907'))) {
+        const finalQuery = explain ? this.createExplainableQuery(dataQuery) : dataQuery;
+        console.error(`[CRITICAL] SQL syntax error (ORA-00907) in find for class "${className}":`);
+        console.error(`  SQL: ${finalQuery}`);
+        console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
+        console.error(`  Where pattern: ${wherePattern}`);
+        console.error(`  Sort pattern: ${sortPattern}`);
+        console.error(`  Pagination pattern: ${paginationPattern}`);
+      }
+      
       throw error;
     } finally {
-      await connection.close();
+      if (connection) {
+        try {
+          await connection.close();
+        } catch (closeError) {
+          debug('Error closing connection in find:', closeError);
+        }
+      }
     }
   }
   // Converts from a Oracle-format object to a REST-format object.
@@ -3205,7 +3539,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     const constraintName = `${className}_unique_${fieldNames.sort().join('_')}`;
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       const checkSql = `
@@ -3324,8 +3659,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     const where = buildWhereClause({ schema, query, caseInsensitive: false });
     const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
 
-    await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       let sql;
@@ -3359,7 +3694,13 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
       throw error;
     } finally {
-      await connection.close();
+      if (connection) {
+        try {
+          await connection.close();
+        } catch (closeError) {
+          debug('Error closing connection in count:', closeError);
+        }
+      }
     }
   }
 
@@ -3373,8 +3714,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     const where = buildWhereClause({ schema, query, caseInsensitive: false });
     const wherePattern = where.pattern ? `WHERE ${where.pattern}` : '';
 
-    await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     try {
       let sql;
@@ -3413,14 +3754,27 @@ export class OracleStorageAdapter implements StorageAdapter {
         }));
       }
 
-      return results.map(object => this.oracleObjectToParseObject(className, object, schema));
+      return results.map(object => {
+        try {
+          return this.oracleObjectToParseObject(className, object, schema);
+        } catch (conversionError) {
+          debug('Error converting Oracle object to Parse object in distinct:', conversionError);
+          throw conversionError;
+        }
+      });
     } catch (error) {
       if (error.errorNum === 904) {
         return [];
       }
       throw error;
     } finally {
-      await connection.close();
+      if (connection) {
+        try {
+          await connection.close();
+        } catch (closeError) {
+          debug('Error closing connection in distinct:', closeError);
+        }
+      }
     }
   }
 
@@ -3612,7 +3966,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     const sql = `SELECT ${columnsList} FROM "${className}" ${wherePattern} ${groupPattern} ${sortPattern} ${skipPattern} ${limitPattern}`.trim();
 
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
     try {
       const result = await connection.execute(
         explain ? this.createExplainableQuery(sql) : sql,
@@ -3624,9 +3979,14 @@ export class OracleStorageAdapter implements StorageAdapter {
         return result.rows;
       }
 
-      const results = result.rows.map(object =>
-        this.oracleObjectToParseObject(className, object, schema)
-      );
+      const results = result.rows.map(object => {
+        try {
+          return this.oracleObjectToParseObject(className, object, schema);
+        } catch (conversionError) {
+          debug('Error converting Oracle object to Parse object in aggregate:', conversionError);
+          throw conversionError;
+        }
+      });
 
       results.forEach(result => {
         if (!Object.prototype.hasOwnProperty.call(result, 'objectId')) {
@@ -3695,7 +4055,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
   async _installOracleFunctions() {
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     connection.execute(sql.misc.jsonObjectSetKeys);
     connection.execute(sql.array.add);
@@ -3711,8 +4072,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   async createIndexes(className: string, indexes: any, conn?: any): Promise<void> {
     debug('createIndexes', className, indexes);
 
-    await this._pgp;
-    const connection = conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = conn || (await pool.getConnection());
     const shouldCloseConnection = !conn;
 
     try {
@@ -3759,8 +4120,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   ): Promise<void> {
     debug('createIndexesIfNeeded', className, fieldName);
 
-    await this._pgp;
-    const connection = conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = conn || (await pool.getConnection());
     const shouldCloseConnection = !conn;
 
     try {
@@ -3797,8 +4158,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   async dropIndexes(className: string, indexes: any, conn?: any): Promise<void> {
     debug('dropIndexes', className, indexes);
 
-    await this._pgp;
-    const connection = conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = conn || (await pool.getConnection());
     const shouldCloseConnection = !conn;
 
     try {
@@ -3854,8 +4215,8 @@ export class OracleStorageAdapter implements StorageAdapter {
           ORDER BY i.index_name, c.column_position
     `;
 
-      await this._pgp;
-      connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    connection = await pool.getConnection();
 
       const result = await connection.execute(
         sql,
@@ -3887,7 +4248,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     debug('updateEstimatedCount', className);
 
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
     try {
       const analyzeSql = `
       BEGIN
@@ -3921,7 +4283,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     debug('createTransactionalSession');
 
     await this._pgp;
-    const connection = await this._client.getConnection();
+    const pool = await this._pgp;
+    const connection = await pool.getConnection();
 
     const transactionalSession = {
       connection: connection,
@@ -4002,8 +4365,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   ): Promise<any> {
     debug('ensureIndex', className, fieldNames);
 
-    await this._pgp;
-    const connection = options.conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = options.conn || (await pool.getConnection());
     const shouldCloseConnection = !options.conn;
 
     try {
@@ -4060,8 +4423,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   async deleteIdempotencyFunction(options: any = {}): Promise<any> {
     debug('deleteIdempotencyFunction');
 
-    await this._pgp;
-    const connection = options.conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = options.conn || (await pool.getConnection());
     const shouldCloseConnection = !options.conn;
 
     try {
@@ -4098,8 +4461,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   async ensureIdempotencyFunctionExists(options: any = {}): Promise<any> {
     debug('ensureIdempotencyFunctionExists');
 
-    await this._pgp;
-    const connection = options.conn || (await this._client.getConnection());
+    const pool = await this._pgp;
+    const connection = options.conn || (await pool.getConnection());
     const shouldCloseConnection = !options.conn;
 
     try {
