@@ -296,22 +296,19 @@ const transformDotField = fieldName => {
   if (components.length === 1) {
     return components[0];
   }
-  let name = '$.';
-  for (let i = 0; i < components.length - 1; ++i) {
+  // First component is the column name, rest form the JSON path
+  const columnName = components[0]; // e.g., "authData"
+  let jsonPath = '$';
+  // Build JSON path from remaining components (skip the first one)
+  for (let i = 1; i < components.length; ++i) {
     if (Number.isInteger(components[i])) {
-      name += `[${components[i]}].`;
+      jsonPath += `[${components[i]}]`;
     } else {
-      name += `${components[i]}.`;
+      jsonPath += `.${components[i]}`;
     }
   }
 
-  if (Number.isInteger(components[components.length - 1])) {
-    name += `[${components[components.length - 1]}]`;
-  } else {
-    name += `${components[components.length - 1]}`;
-  }
-
-  return `JSON_VALUE(components[0], '${name}')`;
+  return `JSON_VALUE(${columnName}, '${jsonPath}')`;
 };
 
 const transformAggregateField = fieldName => {
@@ -402,8 +399,10 @@ const buildWhereClause = ({ schema, query, caseInsensitive, startBindIndex = 0, 
       binds[valueParam] = fieldValue;
     } else if (fieldName.indexOf('.') >= 0) {
       let name = transformDotField(fieldName);
+      // transformDotField returns a complete JSON_VALUE expression, don't wrap it in quotes
+      const isJsonValueExpression = name.startsWith('JSON_VALUE');
       if (fieldValue === null) {
-        patterns.push(`"${name}" IS NULL`);
+        patterns.push(isJsonValueExpression ? `${name} IS NULL` : `"${name}" IS NULL`);
         continue;
       } else {
         if (fieldValue.$in) {
@@ -415,7 +414,7 @@ const buildWhereClause = ({ schema, query, caseInsensitive, startBindIndex = 0, 
           // Handle later
         } else if (typeof fieldValue !== 'object') {
           const valueParam = getBindName('val');
-          patterns.push(`"${name}" = :${valueParam}`);
+          patterns.push(isJsonValueExpression ? `${name} = :${valueParam}` : `"${name}" = :${valueParam}`);
           binds[valueParam] = fieldValue;
         }
       }
@@ -2438,47 +2437,12 @@ export class OracleStorageAdapter implements StorageAdapter {
       throw new Parse.Error(Parse.Error.INTERNAL_SERVER_ERROR, errorMsg);
     }
 
-    // Always log SQL for _User class to help debug
-    if (className === '_User') {
-      console.log(`[DEBUG] createObject SQL for _User:`);
-      console.log(`  SQL: ${insertSql}`);
-      console.log(`  Columns (${columnCount}):`, allColumns);
-      console.log(`  Values (${valueCount}):`, valuesList);
-      console.log(`  Binds:`, Object.keys(binds).sort().map(k => `${k}=${typeof binds[k]}`));
-    }
-
-    // Debug logging to help diagnose issues - always log for _User class
-    if (columnsArray.length !== valuesArray.length || className === '_User') {
-      debug(`createObject SQL generation for class "${className}":`);
-      debug(`  columnsArray.length=${columnsArray.length}, valuesArray.length=${valuesArray.length}`);
-      debug(`  columnsArray:`, columnsArray);
-      debug(`  valuesArray types:`, valuesArray.map(v => typeof v));
-      debug(`  dateFields:`, Array.from(dateFields));
-      debug(`  columnToBindIndex:`, Array.from(columnToBindIndex.entries()));
-      debug(`  columnsList:`, columnsList);
-      debug(`  valuesList:`, valuesList);
-      debug(`  insertSql:`, insertSql);
-      debug(`  binds keys:`, Object.keys(binds));
-      debug(`  binds values:`, Object.values(binds).map(v => typeof v === 'string' ? v.substring(0, 50) : v));
-    }
 
     const pool = await this._pgp;
     const connection = transactionalSession || (await pool.getConnection());
     const shouldCloseConnection = !transactionalSession;
 
     try {
-      // Log the exact SQL and binds before execution for debugging
-      if (className === '_User') {
-        console.error(`[ERROR DEBUG] About to execute SQL for _User:`);
-        console.error(`  SQL: ${insertSql}`);
-        console.error(`  Binds count: ${Object.keys(binds).length}`);
-        console.error(`  Binds:`, JSON.stringify(Object.keys(binds).reduce((acc, k) => {
-          const val = binds[k];
-          acc[k] = typeof val === 'string' ? (val.length > 100 ? val.substring(0, 100) + '...' : val) : val;
-          return acc;
-        }, {}), null, 2));
-      }
-      
       await connection.execute(insertSql, binds);
 
       if (shouldCloseConnection) {
@@ -2491,34 +2455,6 @@ export class OracleStorageAdapter implements StorageAdapter {
         await connection.rollback();
       }
 
-      // Enhanced error logging for SQL syntax errors
-      if (error.errorNum === 907 || (error.message && error.message.includes('ORA-00907'))) {
-        const errorDetails = {
-          className,
-          sql: insertSql,
-          columnsArray: columnsArray,
-          valuesArray: valuesArray.map(v => typeof v === 'object' ? JSON.stringify(v).substring(0, 100) : v),
-          bindsKeys: Object.keys(binds).sort(),
-          bindsValues: Object.keys(binds).sort().reduce((acc, k) => {
-            const val = binds[k];
-            acc[k] = typeof val === 'string' ? (val.length > 50 ? val.substring(0, 50) + '...' : val) : val;
-            return acc;
-          }, {}),
-          dateFields: Array.from(dateFields),
-          columnToBindIndex: Array.from(columnToBindIndex.entries()),
-          columnsList,
-          valuesList,
-          allColumns,
-          objectKeys: Object.keys(object),
-          openParens,
-          closeParens
-        };
-        console.error(`[CRITICAL] SQL syntax error (ORA-00907) in createObject:`, JSON.stringify(errorDetails, null, 2));
-        console.error(`SQL: ${insertSql}`);
-        console.error(`Columns: [${allColumns.join(', ')}]`);
-        console.error(`Values: [${valuesList.join(', ')}]`);
-        console.error(`Binds:`, binds);
-      }
 
       // ORA-00001: unique constraint violated
       if (error.errorNum === 1) {
@@ -2568,11 +2504,6 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     try {
       const selectSql = `SELECT * FROM "${className}" WHERE ${wherePattern}`;
-      console.error(`[SQL DEBUG] About to execute DELETE query for class "${className}":`);
-      console.error(`  SELECT SQL: ${selectSql}`);
-      console.error(`  DELETE SQL: DELETE FROM "${className}" WHERE ${wherePattern}`);
-      console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
-      
       const selectResult = await connection.execute(selectSql, where.binds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
@@ -2599,14 +2530,6 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       if (error.errorNum === 942) {
         return { count: 0, objects: [] };
-      }
-      
-      // Enhanced error logging for SQL syntax errors
-      if (error.errorNum === 907 || (error.message && error.message.includes('ORA-00907'))) {
-        console.error(`[CRITICAL] SQL syntax error (ORA-00907) in deleteObjectsByQuery for class "${className}":`);
-        console.error(`  SELECT SQL: SELECT * FROM "${className}" WHERE ${wherePattern}`);
-        console.error(`  DELETE SQL: DELETE FROM "${className}" WHERE ${wherePattern}`);
-        console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
       }
 
       throw error;
@@ -2909,10 +2832,6 @@ export class OracleStorageAdapter implements StorageAdapter {
     try {
       const selectSql = `SELECT * FROM "${className}" ${whereClause}`;
       
-      console.error(`[SQL DEBUG] About to execute UPDATE query for class "${className}":`);
-      console.error(`  SELECT SQL: ${selectSql}`);
-      console.error(`  Binds:`, JSON.stringify(binds || {}, null, 2));
-      
       // Extract only the bind variables actually used in the SELECT SQL
       // Oracle may be strict about only passing bind variables that are referenced in the SQL
       // Extract bind variables while ignoring those inside string literals
@@ -3088,10 +3007,6 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       if (updatePatterns.length > 0) {
         const updateSql = `UPDATE "${className}" SET ${updatePatterns.join(', ')} ${whereClause}`;
-        
-        console.error(`[SQL DEBUG] About to execute UPDATE statement for class "${className}":`);
-        console.error(`  UPDATE SQL: ${updateSql}`);
-        console.error(`  Binds:`, JSON.stringify(binds || {}, null, 2));
         
         // Helper function to recompile array_contains if needed
         const recompileArrayContainsIfNeeded = async (error, sqlText) => {
@@ -3348,12 +3263,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     const connection = await pool.getConnection();
 
     try {
-      // Log SQL before execution for debugging
       const finalQuery = explain ? this.createExplainableQuery(dataQuery) : dataQuery;
-      console.error(`[SQL DEBUG] About to execute FIND query for class "${className}":`);
-      console.error(`  SQL: ${finalQuery}`);
-      console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
-      
       const result = await connection.execute(
         finalQuery,
         where.binds || {},
@@ -3378,18 +3288,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (error.errorNum === 942) {
         return [];
       }
-      
-      // Enhanced error logging for SQL syntax errors
-      if (error.errorNum === 907 || (error.message && error.message.includes('ORA-00907'))) {
-        const finalQuery = explain ? this.createExplainableQuery(dataQuery) : dataQuery;
-        console.error(`[CRITICAL] SQL syntax error (ORA-00907) in find for class "${className}":`);
-        console.error(`  SQL: ${finalQuery}`);
-        console.error(`  Binds:`, JSON.stringify(where.binds || {}, null, 2));
-        console.error(`  Where pattern: ${wherePattern}`);
-        console.error(`  Sort pattern: ${sortPattern}`);
-        console.error(`  Pagination pattern: ${paginationPattern}`);
-      }
-      
+
       throw error;
     } finally {
       if (connection) {
