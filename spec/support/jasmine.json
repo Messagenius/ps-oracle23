@@ -1,6 +1,11 @@
 {
   "spec_dir": "spec",
   "spec_files": [
+    "**/DatabaseController.spec.js",
+    "**/OracleStorageAdapter.spec.js",
+    "**/OracleInitOptions.spec.js",
+    "**/PostgresConfigParser.spec.js",
+    "**/ParseAPI.spec.js",
     "**/ParseACL.spec.js"
   ],
   "helpers": ["helper.js"],

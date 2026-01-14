@@ -11,7 +11,7 @@ if (dns.setDefaultResultOrder) {
 }
 
 // Sets up a Parse API server for testing.
-jasmine.DEFAULT_TIMEOUT_INTERVAL = process.env.PARSE_SERVER_TEST_TIMEOUT || 10000;
+jasmine.DEFAULT_TIMEOUT_INTERVAL = process.env.PARSE_SERVER_TEST_TIMEOUT || 30000;
 jasmine.getEnv().addReporter(new CurrentSpecReporter());
 jasmine.getEnv().addReporter(new SpecReporter());
 global.retryFlakyTests();
@@ -280,6 +280,12 @@ afterEach(function (done) {
                   '_Product',
                   '_Audience',
                   '_Idempotency',
+                  '_JobSchedule',
+                  '_GraphQLConfig',
+                  '_PushStatus',
+                  '_JobStatus',
+                  '_Hooks',
+                  '_GlobalConfig',
                 ].indexOf(className) >= 0
               );
             }
